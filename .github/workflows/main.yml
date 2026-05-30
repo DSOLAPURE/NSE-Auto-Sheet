@@ -2,21 +2,25 @@ name: Update NSE Stocks to Google Sheet
 
 on:
   schedule:
-    # यह समय 14:45 UTC है, जिसका मतलब भारत में रात 8:15 PM है
+    # 14:45 UTC = 8:15 PM IST, runs Mon–Fri
     - cron: '45 14 * * 1-5'
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   update-sheet:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install Libraries
         run: pip install gspread oauth2client pandas requests
