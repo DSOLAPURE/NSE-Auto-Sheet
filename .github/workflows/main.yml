@@ -1,45 +1,27 @@
-name: NSE Auto-Sheet Updater
+name: Update NSE Stocks to Google Sheet
 
 on:
   schedule:
-    # Run Mon–Fri at 6:30 AM IST (1:00 AM UTC) — after NSE bhavcopy is published
-    - cron: "0 1 * * 1-5"
-    # Run again at 4:00 PM IST (10:30 AM UTC) — end-of-day data
-    - cron: "30 10 * * 1-5"
-
-  # Allow manual trigger from GitHub Actions tab
+    # यह समय 14:45 UTC है, जिसका मतलब भारत में रात 8:15 PM है
+    - cron: '45 14 * * 1-5'
   workflow_dispatch:
 
 jobs:
-  update-sheets:
+  update-sheet:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
     steps:
-      # ── 1. Checkout repo ────────────────────────────────────────────
-      - name: Checkout repository
+      - name: Checkout Repo
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python ────────────────────────────────────────────
-      - name: Set up Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.10'
 
-      # ── 3. Install dependencies ─────────────────────────────────────
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install Libraries
+        run: pip install gspread oauth2client pandas requests
 
-      # ── 4. Run updater ──────────────────────────────────────────────
-      - name: Run update_sheet.py
+      - name: Run Python Script
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
         run: python update_sheet.py
-
-      # ── 5. Notify on failure ────────────────────────────────────────
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "❌ Sheet update failed at $(date -u '+%Y-%m-%d %H:%M UTC')"
-          echo "Check the Actions log above for details."
