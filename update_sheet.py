@@ -274,7 +274,7 @@ def _expiry_dates() -> tuple:
     for _ in range(6):
         exp = _last_thursday_of_month(y, m)
         if exp >= today:
-            expiries.append(exp.strftime("%d %b %Y"))
+            expiries.append(exp.strftime("%d-%b-%Y"))
         if len(expiries) == 3:
             break
         m += 1
@@ -1087,7 +1087,12 @@ class SheetsWriter:
     def write_fo_sheet(
         self, ws, headers: list, rows: list, title: str
     ) -> None:
-        """Clear the sheet and rewrite header + all data rows in chunks."""
+        """
+        Clear the sheet and rewrite header + all data rows in chunks.
+        Uses RAW input so Google Sheets never auto-converts strings to
+        dates (e.g. "26-Jun-2026" stays as text, not a date serial).
+        """
+       
         all_data = [headers] + rows
         n_cols   = len(headers)
         ws.clear()
@@ -1099,7 +1104,7 @@ class SheetsWriter:
             ws.update(
                 range_name=rng,
                 values=all_data[start:end],
-                value_input_option="USER_ENTERED",
+                value_input_option="RAW"   # RAW: no auto date/number conversion by Sheets,
             )
             log.info("  '%s' — wrote rows %d–%d", title, start + 1, end)
             if end < len(all_data):
