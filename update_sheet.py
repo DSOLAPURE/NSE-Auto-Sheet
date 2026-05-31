@@ -1110,13 +1110,36 @@ class SheetsWriter:
         )
 
     def write_vol_turnover(self, ws_vol, ws_to, data_vol, data_to, fetched_date):
-        status=f"Data: {fetched_date}  |  Updated: {_ist_now()}"
-        for ws,data in ((ws_vol,data_vol),(ws_to,data_to)):
-            n=len(data)
-            ws.batch_update([{"range":f"A2:C{n+1}","values":data},
-                             {"range":STATUS_CELL,"values":[[status]]}],
-                            value_input_option="USER_ENTERED")
-            log.info("'%s' → %d rows",ws.title,n)
+        """
+        Write Top 250 Volume and Top 250 Turnover sheets.
+        Fixes vs earlier version:
+          • Sheet is cleared before every write (no stale rows)
+          • Row 1 headers are written explicitly
+          • Status timestamp goes in D1 (same row as headers, not K2)
+          • All 3 data columns (Symbol, Volume/Turnover, CMP) are written
+        """
+        status = f"Data: {fetched_date}  |  Updated: {_ist_now()}"
+
+        vol_headers  = [["NSE Symbol", "Trading Volume (Qty)", "Close Price ₹",
+                          status]]
+        to_headers   = [["NSE Symbol", "Turnover ₹",          "Close Price ₹",
+                          status]]
+
+        for ws, data, headers in (
+            (ws_vol, data_vol, vol_headers),
+            (ws_to,  data_to,  to_headers),
+        ):
+            ws.clear()
+            time.sleep(0.5)
+            n = len(data)
+            all_rows = headers + data          # row 1 = header, rows 2‥N+1 = data
+            # Write header + data in one batch (≤250 rows — well within limits)
+            ws.update(
+                range_name=f"A1:D{n + 1}",
+                values=all_rows,
+                value_input_option="USER_ENTERED",
+            )
+            log.info("'%s' → %d data rows written (+ 1 header)", ws.title, n)
 
     def write_fo_sheet(self, ws, headers, rows, title):
         all_data=[headers]+rows
