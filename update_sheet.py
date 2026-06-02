@@ -1,37 +1,32 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  NSE F&O Auto-Sheet  —  update_sheet.py  (v6 — Full Analytics Edition)     ║
+║  NSE F&O Auto-Sheet  —  update_sheet.py  (v7 — All Analytics Fixed)        ║
 ║  GitHub: DSOLAPURE/NSE-Auto-Sheet                                           ║
 ║                                                                              ║
-║  Sheets updated:                                                             ║
-║    1. Top 250 Stocks    — top 250 NSE equities by trading volume            ║
-║    2. Top 250 Turnover  — top 250 NSE equities by turnover value            ║
-║    3. Futures F&O       — 5 indices + all F&O stocks (48 columns)           ║
-║    4. Options F&O       — 5 indices + all F&O stocks (52 columns)           ║
+║  FIXES in v7 (all data columns now populated):                              ║
 ║                                                                              ║
-║  NEW in v6 — 12 analytics columns added to both F&O sheets:                ║
-║    • Open Interest (OI)       — from NSE FO bhavcopy ZIP                   ║
-║    • OI Change                — vs previous trading day                     ║
-║    • PCR (Put-Call Ratio)     — computed from CE+PE OI                     ║
-║    • 52-Week High / Low       — from NSE 52wk CSV                          ║
-║    • Delivery %               — from NSE CM bhavcopy                       ║
-║    • India VIX                — from NSE index CSV                          ║
-║    • IV % (Implied Volatility)— back-solved from ATM premium               ║
-║    • Max Pain Strike          — from OI distribution                        ║
-║    • Support / Resistance     — computed: recent swing lows/highs           ║
-║    • Beta vs Nifty            — computed from 20-day returns                ║
-║    • RSI (14-day)             — Wilder RSI from close history               ║
-║    • MACD Signal              — 12/26/9 EMA MACD                           ║
+║  Bug 1 — OI / PCR / Max Pain                                                ║
+║    Root cause: NSE blocks requests without a browser session cookie.        ║
+║    Fix: NSESession class warms up cookies via homepage + API ping           ║
+║         before fetching FO bhavcopy ZIP.                                    ║
 ║                                                                              ║
-║  Data sources:                                                               ║
-║    • Equity CMP/Vol/Delivery → NSE UDiFF bhavcopy ZIP (daily)              ║
-║    • FO OI data              → NSE FO bhavcopy ZIP (daily)                  ║
-║    • Index CMP / India VIX   → NSE ind_close_all_{date}.csv                ║
-║    • 52-Week High/Low        → NSE 52wk CSV                                ║
-║    • Lot sizes               → NSE fo_mktlots.csv                          ║
-║    • All indicators          → computed from 20-day price history           ║
+║  Bug 2 — Delivery %                                                         ║
+║    Root cause: CM bhavcopy (UDiFF format) does NOT contain delivery         ║
+║         columns. Delivery data is in a separate NSE file:                   ║
+║         sec_bhavdata_full_{date}.csv  (columns: DELIV_QTY, DELIV_PER)      ║
+║    Fix: DeliveryFetcher hits the correct URL.                               ║
 ║                                                                              ║
-║  Runs: Mon–Fri 06:30 IST + 16:00 IST via GitHub Actions                   ║
+║  Bug 3 — 52-Week High / Low                                                 ║
+║    Root cause: static CSV needs the same session cookie.                    ║
+║    Fix: fetched via NSESession.                                             ║
+║                                                                              ║
+║  Bug 4 — MACD (needs 27+ data points)                                      ║
+║    Root cause: HISTORY_DAYS=20 is sometimes too few if some days            ║
+║         fail, leaving < 27 closes → MACD returns "—".                      ║
+║    Fix: HISTORY_DAYS raised to 35; fetcher requests up to 50 days.         ║
+║                                                                              ║
+║  Bug 5 — Max Pain empty                                                     ║
+║    Root cause: depended on OI data (fixed by Bug 1 fix).                   ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -46,7 +41,7 @@ import json
 import logging
 import math
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — CONFIGURATION
@@ -57,14 +52,13 @@ SHEET_VOLUME    = "Top 250 Stocks"
 SHEET_TURNOVER  = "Top 250 Turnover"
 SHEET_FUTURES   = "Futures F&O"
 SHEET_OPTIONS   = "Options F&O"
-STATUS_CELL     = "K2"
 TOP_N           = 250
 LOOKBACK_DAYS   = 7
-REQUEST_TIMEOUT = 25
+REQUEST_TIMEOUT = 30
 MAX_RETRIES     = 3
 RETRY_DELAY     = 5
-HISTORY_DAYS    = 20          # need 20 days for MACD (26 EMA)
-WRITE_CHUNK     = 100         # smaller chunks — more columns now
+HISTORY_DAYS    = 35          # raised: need 27+ for MACD, buffer for missed days
+WRITE_CHUNK     = 100
 EXCLUDE_PATTERN = r"BEES|ETF|GOLD|LIQUID|CASE|SILVER|LIQ"
 
 # ── NSE URLs ─────────────────────────────────────────────────────────────────
@@ -74,6 +68,10 @@ FO_BHAV_URL    = ("https://nsearchives.nseindia.com/content/fo/"
                   "BhavCopy_NSE_FO_0_0_0_{date}_F_0000.csv.zip")
 INDEX_CSV_URL  = ("https://nsearchives.nseindia.com/content/indices/"
                   "ind_close_all_{date}.csv")
+# FIX Bug 2: correct delivery data URL (separate from CM bhavcopy)
+DELIVERY_URL   = ("https://archives.nseindia.com/products/content/"
+                  "sec_bhavdata_full_{date}.csv")
+# FIX Bug 3: 52-week URL (correct, needs session)
 WEEK52_URL     = "https://archives.nseindia.com/content/equities/52_wk_high_low.csv"
 MKTLOTS_URL    = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
 
@@ -81,24 +79,14 @@ COL_MAP = {
     "symbol":   ["TckrSymb",    "SYMBOL"],
     "close":    ["ClsPric",     "CLOSE"],
     "series":   ["SctySrs",     "SERIES"],
-    "volume":   ["TtlTradgVol", "TOTTRDQTY", "TtlTrdQty",  "TotTrdQty"],
-    "turnover": ["TtlTrfVal",   "TOTTRDVAL", "TtlTrdVal",  "TotTrdVal"],
-    "delivery": ["DlvrQty",     "DELQTY",    "DeliveryQty"],
-    "delv_pct": ["DlvrPct",     "DELPCT",    "DeliveryPct", "%Dly Qt to Traded Qty"],
+    "volume":   ["TtlTradgVol", "TOTTRDQTY", "TtlTrdQty", "TotTrdQty"],
+    "turnover": ["TtlTrfVal",   "TOTTRDVAL", "TtlTrdVal", "TotTrdVal"],
 }
 
 GSHEETS_SCOPES = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
-
-NSE_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/124.0 Safari/537.36"),
-    "Referer":        "https://www.nseindia.com/",
-    "Accept-Language":"en-US,en;q=0.9",
-}
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -123,12 +111,11 @@ INDEX_NAME_MAP = {
     "Nifty 50":"NIFTY","Nifty Bank":"BANKNIFTY",
     "Nifty Financial Services":"FINNIFTY","Nifty Fin Services":"FINNIFTY",
     "Nifty Midcap Select":"MIDCPNIFTY","Nifty Next 50":"NIFTYNXT50",
-    "India Vix":"VIX","India VIX":"VIX",
+    "India Vix":"VIX","India VIX":"VIX","INDIA VIX":"VIX",
     "NIFTY 50":"NIFTY","NIFTY BANK":"BANKNIFTY",
     "NIFTY FINANCIAL SERVICES":"FINNIFTY","NIFTY MIDCAP SELECT":"MIDCPNIFTY",
-    "NIFTY NEXT 50":"NIFTYNXT50","INDIA VIX":"VIX",
+    "NIFTY NEXT 50":"NIFTYNXT50",
 }
-
 INDEX_FALLBACK_CMP = {
     "NIFTY":24500.0,"BANKNIFTY":52000.0,"FINNIFTY":23800.0,
     "MIDCPNIFTY":12400.0,"NIFTYNXT50":67000.0,
@@ -220,7 +207,79 @@ SECTOR_MAP = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — UTILITY FUNCTIONS
+# SECTION 3 — NSE SESSION  (FIX for Bug 1, 2, 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NSESession:
+    """
+    Manages a persistent requests.Session with NSE cookies.
+    NSE requires a browser-like session (visit homepage first)
+    before it will serve bhavcopy ZIPs and static CSVs.
+    Without this, all NSE archive URLs return HTTP 403.
+    """
+    _BASE_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
+        "Referer":         "https://www.nseindia.com/",
+    }
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(self._BASE_HEADERS)
+        self._warmed = False
+
+    def warm_up(self):
+        """Visit NSE homepage + a JSON API endpoint to obtain session cookies."""
+        if self._warmed:
+            return
+        try:
+            log.info("NSE session warm-up — fetching homepage…")
+            r = self.session.get("https://www.nseindia.com", timeout=REQUEST_TIMEOUT)
+            log.info("  Homepage: HTTP %s  cookies: %s", r.status_code, list(self.session.cookies.keys()))
+            time.sleep(2)
+            # Ping a lightweight API endpoint to solidify the session
+            self.session.get("https://www.nseindia.com/api/marketStatus", timeout=REQUEST_TIMEOUT)
+            time.sleep(1)
+            self._warmed = True
+            log.info("  Session warm-up complete.")
+        except Exception as exc:
+            log.warning("  Session warm-up error (non-fatal): %s", exc)
+            self._warmed = True   # proceed anyway
+
+    def get(self, url: str, label: str = "") -> bytes | None:
+        """Download URL with retry. Returns bytes or None."""
+        self.warm_up()
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                r = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                if r.status_code == 200:
+                    log.info("  %s HTTP 200 (%d bytes)", label or url.split("/")[-1], len(r.content))
+                    return r.content
+                log.warning("  %s HTTP %s (attempt %d/%d)", label, r.status_code, attempt, MAX_RETRIES)
+            except requests.RequestException as exc:
+                log.warning("  %s error attempt %d: %s", label, attempt, exc)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+        log.error("  %s failed after %d attempts.", label, MAX_RETRIES)
+        return None
+
+
+# Global session shared by all fetchers — one warm-up for all
+_NSE = NSESession()
+
+def _download(url: str, label: str = "") -> bytes | None:
+    return _NSE.get(url, label)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — UTILITY FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pick_col(df, candidates):
@@ -230,7 +289,10 @@ def _pick_col(df, candidates):
     raise KeyError(f"None of {candidates} in {list(df.columns)}")
 
 def _ist_now():
-    return (datetime.utcnow()+timedelta(hours=5,minutes=30)).strftime("%d-%b-%Y %H:%M IST")
+    return (datetime.now(timezone.utc)+timedelta(hours=5,minutes=30)).strftime("%d-%b-%Y %H:%M IST")
+
+def _ist_today():
+    return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
 
 def _col_letter(n):
     r=""
@@ -239,7 +301,7 @@ def _col_letter(n):
         r=chr(65+rem)+r
     return r
 
-def _last_thursday_of_month(year, month):
+def _last_thursday(year, month):
     if month==12:
         last=date(year+1,1,1)-timedelta(days=1)
     else:
@@ -247,10 +309,10 @@ def _last_thursday_of_month(year, month):
     return last-timedelta(days=(last.weekday()-3)%7)
 
 def _expiry_dates():
-    today=(datetime.utcnow()+timedelta(hours=5,minutes=30)).date()
+    today=_ist_today().date()
     expiries,m,y=[],today.month,today.year
     for _ in range(6):
-        exp=_last_thursday_of_month(y,m)
+        exp=_last_thursday(y,m)
         if exp>=today:
             expiries.append(exp.strftime("%d-%b-%Y"))
         if len(expiries)==3: break
@@ -259,18 +321,6 @@ def _expiry_dates():
     while len(expiries)<3: expiries.append("—")
     return tuple(expiries)
 
-def _download_raw(url, label=""):
-    for attempt in range(1, MAX_RETRIES+1):
-        try:
-            r=requests.get(url,headers=NSE_HEADERS,timeout=REQUEST_TIMEOUT)
-            if r.status_code==200: return r.content
-            log.warning("%s HTTP %s (attempt %d/%d)",label,r.status_code,attempt,MAX_RETRIES)
-        except requests.RequestException as e:
-            log.warning("%s error attempt %d/%d: %s",label,attempt,MAX_RETRIES,e)
-        if attempt<MAX_RETRIES: time.sleep(RETRY_DELAY)
-    log.error("%s failed — %s",label,url)
-    return None
-
 def _atm_premium(ltp, days=25, iv=0.28):
     prem=0.4*iv*math.sqrt(max(days,1)/252)*ltp
     return max(5,int(round(prem/5)*5))
@@ -278,7 +328,7 @@ def _atm_premium(ltp, days=25, iv=0.28):
 def _trend(closes):
     if len(closes)<3: return "Sideways"
     n=len(closes)
-    avg5=sum(closes[-min(5,n):])/min(5,n)
+    avg5 =sum(closes[-min(5, n):])/min(5, n)
     avg20=sum(closes[-min(20,n):])/min(20,n)
     if avg20==0: return "Sideways"
     diff=(avg5-avg20)/avg20*100
@@ -297,305 +347,254 @@ def _round_strike(ltp):
     else:          step=5
     return int(round(ltp/step)*step)
 
-def _na(v, fmt=None):
-    """Return formatted value or '—' if falsy/zero."""
-    if v is None or v!=v:  # NaN check
-        return "—"
-    if isinstance(v,(int,float)) and v==0:
-        return "—"
-    if fmt=="pct":   return f"{v:.1f}%"
-    if fmt=="2f":    return f"{v:.2f}"
-    if fmt=="int":   return int(round(v))
-    if fmt=="cr":    return f"₹{v/1e7:.2f} Cr"
-    return v
+def _trading_days_back(ist_today, n=50):
+    """Yield up to n recent trading-day datetime objects (most recent first)."""
+    count=0
+    for d in range(1, n*2):
+        cand=ist_today-timedelta(days=d)
+        if cand.weekday()<5:
+            yield cand
+            count+=1
+            if count>=n: break
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — ANALYTICS CALCULATORS
+# SECTION 5 — ANALYTICS CALCULATORS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _calc_rsi(closes, period=14):
-    """Wilder RSI from close price list (oldest→newest). Returns float or None."""
-    if len(closes) < period+1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        chg = closes[i] - closes[i-1]
-        gains.append(max(chg, 0))
-        losses.append(max(-chg, 0))
-    # Wilder smoothing: use last `period` values
-    ag = sum(gains[-period:]) / period
-    al = sum(losses[-period:]) / period
-    if al == 0:
-        return 100.0
-    rs = ag / al
-    return round(100 - (100 / (1 + rs)), 1)
+    if len(closes)<period+2: return None
+    gains,losses=[],[]
+    for i in range(1,len(closes)):
+        chg=closes[i]-closes[i-1]
+        gains.append(max(chg,0)); losses.append(max(-chg,0))
+    ag=sum(gains[-period:])/period
+    al=sum(losses[-period:])/period
+    if al==0: return 100.0
+    return round(100-(100/(1+ag/al)),1)
 
 def _rsi_label(rsi):
     if rsi is None: return "—"
-    if rsi >= 70:   return f"{rsi} 🔴 Overbought"
-    if rsi <= 30:   return f"{rsi} 🟢 Oversold"
+    if rsi>=70:  return f"{rsi} 🔴 Overbought"
+    if rsi<=30:  return f"{rsi} 🟢 Oversold"
     return f"{rsi} 🟡 Neutral"
 
 def _calc_ema(closes, period):
-    """Exponential Moving Average. Returns list same length as closes."""
     if not closes: return []
-    k = 2 / (period + 1)
-    ema = [closes[0]]
+    k=2/(period+1); ema=[closes[0]]
     for p in closes[1:]:
-        ema.append(p * k + ema[-1] * (1 - k))
+        ema.append(p*k+ema[-1]*(1-k))
     return ema
 
 def _calc_macd(closes):
-    """
-    Standard 12/26/9 MACD.
-    Returns (macd_line, signal_line, histogram, label_str) or (None,None,None,'—').
-    """
-    if len(closes) < 27:
-        return None, None, None, "—"
-    ema12 = _calc_ema(closes, 12)
-    ema26 = _calc_ema(closes, 26)
-    macd_line  = [e12 - e26 for e12, e26 in zip(ema12, ema26)]
-    signal     = _calc_ema(macd_line, 9)
-    histogram  = [m - s for m, s in zip(macd_line, signal)]
-    m  = round(macd_line[-1], 2)
-    s  = round(signal[-1], 2)
-    h  = round(histogram[-1], 2)
-    if h > 0 and macd_line[-1] > 0:
-        label = f"🟢 Bullish  MACD={m}  Sig={s}  Hist=+{h}"
-    elif h > 0:
-        label = f"🟡 Recovering  MACD={m}  Sig={s}  Hist=+{h}"
-    elif h < 0 and macd_line[-1] < 0:
-        label = f"🔴 Bearish  MACD={m}  Sig={s}  Hist={h}"
-    else:
-        label = f"🟡 Weakening  MACD={m}  Sig={s}  Hist={h}"
-    return m, s, h, label
+    """12/26/9 MACD. Needs len(closes) >= 27."""
+    if len(closes)<27: return None,None,None,"—"
+    e12=_calc_ema(closes,12); e26=_calc_ema(closes,26)
+    macd=[a-b for a,b in zip(e12,e26)]
+    sig=_calc_ema(macd,9)
+    hist=[m-s for m,s in zip(macd,sig)]
+    m,s,h=round(macd[-1],2),round(sig[-1],2),round(hist[-1],2)
+    if   h>0 and m>0: label=f"🟢 Bullish  MACD={m}  Sig={s}  Hist=+{h}"
+    elif h>0:          label=f"🟡 Recovering  MACD={m}  Sig={s}  Hist=+{h}"
+    elif h<0 and m<0:  label=f"🔴 Bearish  MACD={m}  Sig={s}  Hist={h}"
+    else:              label=f"🟡 Weakening  MACD={m}  Sig={s}  Hist={h}"
+    return m,s,h,label
 
 def _calc_beta(stock_closes, nifty_closes):
-    """Beta of stock vs Nifty from daily return series."""
-    n = min(len(stock_closes), len(nifty_closes))
-    if n < 5:
-        return None
-    s_ret = [(stock_closes[i]-stock_closes[i-1])/stock_closes[i-1]
-              for i in range(1, n)]
-    n_ret = [(nifty_closes[i]-nifty_closes[i-1])/nifty_closes[i-1]
-              for i in range(1, n)]
-    if len(s_ret) < 4: return None
-    mean_s = sum(s_ret)/len(s_ret)
-    mean_n = sum(n_ret)/len(n_ret)
-    cov = sum((s-mean_s)*(ni-mean_n) for s,ni in zip(s_ret,n_ret))/len(s_ret)
-    var_n = sum((ni-mean_n)**2 for ni in n_ret)/len(n_ret)
-    if var_n == 0: return None
-    return round(cov/var_n, 2)
+    n=min(len(stock_closes),len(nifty_closes))
+    if n<5: return None
+    sr=[(stock_closes[i]-stock_closes[i-1])/stock_closes[i-1] for i in range(1,n)]
+    nr=[(nifty_closes[i]-nifty_closes[i-1])/nifty_closes[i-1] for i in range(1,n)]
+    if len(sr)<4: return None
+    ms,mn=sum(sr)/len(sr),sum(nr)/len(nr)
+    cov=sum((s-ms)*(ni-mn) for s,ni in zip(sr,nr))/len(sr)
+    vn =sum((ni-mn)**2 for ni in nr)/len(nr)
+    return round(cov/vn,2) if vn else None
 
 def _calc_support_resistance(closes):
-    """
-    Simple support/resistance from recent price history.
-    Support  = lowest low of last 10 sessions.
-    Resistance = highest high of last 10 sessions.
-    Returns (support, resistance) as rounded floats.
-    """
-    if len(closes) < 5:
-        return None, None
-    window = closes[-min(10, len(closes)):]
-    support    = round(min(window), 2)
-    resistance = round(max(window), 2)
-    return support, resistance
+    if len(closes)<5: return None,None
+    w=closes[-min(10,len(closes)):]
+    return round(min(w),2),round(max(w),2)
 
 def _calc_iv(ltp, atm_prem, days=25):
-    """
-    Back-solve IV from ATM premium using Black-Scholes approximation:
-      IV ≈ premium / (0.4 × S × √(T/252))
-    Returns IV as percentage string.
-    """
-    denom = 0.4 * ltp * math.sqrt(max(days,1)/252)
-    if denom == 0: return "—"
-    iv = atm_prem / denom * 100
-    return f"{iv:.1f}%"
+    denom=0.4*ltp*math.sqrt(max(days,1)/252)
+    if denom==0: return "—"
+    return f"{atm_prem/denom*100:.1f}%"
 
 def _calc_max_pain(oi_by_strike):
-    """
-    Max Pain = strike at which total loss to option buyers is maximum.
-    oi_by_strike: dict {strike: {"CE": oi, "PE": oi}}
-    Returns max pain strike (int) or None.
-    """
-    if not oi_by_strike:
-        return None
-    strikes = sorted(oi_by_strike.keys())
-    min_pain, max_pain_strike = float("inf"), strikes[0]
+    if not oi_by_strike: return None
+    strikes=sorted(oi_by_strike.keys())
+    min_pain,best=float("inf"),strikes[0]
     for s_test in strikes:
-        total_loss = 0
-        for s_strike, data in oi_by_strike.items():
-            # Call holders lose if test strike > strike (calls are ITM)
-            if s_test > s_strike:
-                total_loss += (s_test - s_strike) * data.get("CE", 0)
-            # Put holders lose if test strike < strike (puts are ITM)
-            if s_test < s_strike:
-                total_loss += (s_strike - s_test) * data.get("PE", 0)
-        if total_loss < min_pain:
-            min_pain = total_loss
-            max_pain_strike = s_test
-    return max_pain_strike
+        loss=0
+        for s_str,data in oi_by_strike.items():
+            if s_test>s_str: loss+=(s_test-s_str)*data.get("CE",0)
+            if s_test<s_str: loss+=(s_str-s_test)*data.get("PE",0)
+        if loss<min_pain: min_pain,best=loss,s_test
+    return best
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — STRATEGY ENGINE  (unchanged from v5)
+# SECTION 6 — STRATEGY ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _strategy_engine(ltp, atm_prem, intra_trend, swing_trend, lot, timeframe="intraday"):
+def _strategy_engine(ltp,atm_prem,intra_trend,swing_trend,lot,timeframe="intraday"):
     trend=intra_trend if timeframe=="intraday" else swing_trend
     atm=_round_strike(ltp)
-    if ltp>20000: step=100
-    elif ltp>5000: step=50
-    elif ltp>1000: step=20
-    elif ltp>200: step=10
-    else: step=5
+    step=(100 if ltp>20000 else 50 if ltp>5000 else 20 if ltp>1000 else 10 if ltp>200 else 5)
     otm1=atm+step; otm2=atm+2*step; itm1=atm-step; itm2=atm-2*step
-    p_atm=atm_prem
-    p_otm1=max(5,int(p_atm*0.55/5)*5)
-    p_otm2=max(5,int(p_atm*0.30/5)*5)
-
+    pa=atm_prem
+    po1=max(5,int(pa*0.55/5)*5); po2=max(5,int(pa*0.30/5)*5)
     if trend=="Bullish":
         if timeframe=="intraday":
-            sl=max(5,int(p_atm*0.5))
-            return {"Strategy":"Long Call","CE Entry":f"Buy {atm} CE @ ₹{p_atm}",
-                    "PE Entry":"—","CE Target":f"₹{p_atm*2} (2× premium)","PE Target":"—",
-                    "Stop Loss":f"₹{sl} (50% of premium)","Max Profit/Lot":f"₹{p_atm*2*lot:,}",
-                    "Max Loss/Lot":f"₹{p_atm*lot:,}","Risk:Reward":"1:2",
-                    "Rationale":f"Intraday bullish. Buy ATM {atm} CE @ ₹{p_atm}. Target ₹{p_atm*2}, SL ₹{sl}."}
+            sl=max(5,int(pa*0.5))
+            return {"Strategy":"Long Call","CE Entry":f"Buy {atm} CE @ ₹{pa}",
+                    "PE Entry":"—","CE Target":f"₹{pa*2} (2× premium)","PE Target":"—",
+                    "Stop Loss":f"₹{sl} (50% of premium)",
+                    "Max Profit/Lot":f"₹{pa*2*lot:,}","Max Loss/Lot":f"₹{pa*lot:,}",
+                    "Risk:Reward":"1:2","Rationale":f"Intraday bullish. Buy ATM {atm} CE @ ₹{pa}. Target ₹{pa*2}, SL ₹{sl}."}
         else:
-            nd=p_atm-p_otm1; mg=(otm1-atm)-nd; rr=round(mg/max(nd,1),1)
+            nd=pa-po1; mg=(otm1-atm)-nd; rr=round(mg/max(nd,1),1)
             return {"Strategy":"Bull Call Spread",
-                    "CE Entry":f"Buy {atm} CE @ ₹{p_atm} | Sell {otm1} CE @ ₹{p_otm1}",
+                    "CE Entry":f"Buy {atm} CE @ ₹{pa} | Sell {otm1} CE @ ₹{po1}",
                     "PE Entry":"—","CE Target":f"Close ≥ ₹{otm1} at expiry","PE Target":"—",
                     "Stop Loss":f"Exit if MTM loss ≈ ₹{int(nd*0.4*lot):,} (40% debit)",
                     "Max Profit/Lot":f"₹{mg*lot:,}","Max Loss/Lot":f"₹{nd*lot:,}",
-                    "Risk:Reward":f"1:{rr}",
-                    "Rationale":f"Swing bullish. Buy {atm} CE ₹{p_atm}, sell {otm1} CE ₹{p_otm1}. Net debit ₹{nd}."}
+                    "Risk:Reward":f"1:{rr}","Rationale":f"Swing bullish. Buy {atm} CE ₹{pa}, sell {otm1} CE ₹{po1}. Net debit ₹{nd}."}
     elif trend=="Bearish":
         if timeframe=="intraday":
-            sl=max(5,int(p_atm*0.5))
+            sl=max(5,int(pa*0.5))
             return {"Strategy":"Long Put","CE Entry":"—",
-                    "PE Entry":f"Buy {atm} PE @ ₹{p_atm}","CE Target":"—",
-                    "PE Target":f"₹{p_atm*2} (2× premium)","Stop Loss":f"₹{sl} (50% of premium)",
-                    "Max Profit/Lot":f"₹{p_atm*2*lot:,}","Max Loss/Lot":f"₹{p_atm*lot:,}",
-                    "Risk:Reward":"1:2",
-                    "Rationale":f"Intraday bearish. Buy ATM {atm} PE @ ₹{p_atm}. Target ₹{p_atm*2}, SL ₹{sl}."}
+                    "PE Entry":f"Buy {atm} PE @ ₹{pa}","CE Target":"—",
+                    "PE Target":f"₹{pa*2} (2× premium)","Stop Loss":f"₹{sl} (50% of premium)",
+                    "Max Profit/Lot":f"₹{pa*2*lot:,}","Max Loss/Lot":f"₹{pa*lot:,}",
+                    "Risk:Reward":"1:2","Rationale":f"Intraday bearish. Buy ATM {atm} PE @ ₹{pa}. Target ₹{pa*2}, SL ₹{sl}."}
         else:
-            nd=p_atm-p_otm1; mg=(atm-itm1)-nd; rr=round(mg/max(nd,1),1)
+            nd=pa-po1; mg=(atm-itm1)-nd; rr=round(mg/max(nd,1),1)
             return {"Strategy":"Bear Put Spread","CE Entry":"—",
-                    "PE Entry":f"Buy {atm} PE @ ₹{p_atm} | Sell {itm1} PE @ ₹{p_otm1}",
+                    "PE Entry":f"Buy {atm} PE @ ₹{pa} | Sell {itm1} PE @ ₹{po1}",
                     "CE Target":"—","PE Target":f"Close ≤ ₹{itm1} at expiry",
                     "Stop Loss":f"Exit if MTM loss ≈ ₹{int(nd*0.4*lot):,} (40% debit)",
                     "Max Profit/Lot":f"₹{mg*lot:,}","Max Loss/Lot":f"₹{nd*lot:,}",
-                    "Risk:Reward":f"1:{rr}",
-                    "Rationale":f"Swing bearish. Buy {atm} PE ₹{p_atm}, sell {itm1} PE ₹{p_otm1}. Net debit ₹{nd}."}
+                    "Risk:Reward":f"1:{rr}","Rationale":f"Swing bearish. Buy {atm} PE ₹{pa}, sell {itm1} PE ₹{po1}. Net debit ₹{nd}."}
     else:
         if timeframe=="intraday":
-            cr=p_otm1*2; be_hi=otm1+cr; be_lo=itm1-cr
-            return {"Strategy":"Short Strangle",
-                    "CE Entry":f"Sell {otm1} CE @ ₹{p_otm1}",
-                    "PE Entry":f"Sell {itm1} PE @ ₹{p_otm1}",
+            cr=po1*2; be_hi=otm1+cr; be_lo=itm1-cr
+            return {"Strategy":"Short Strangle","CE Entry":f"Sell {otm1} CE @ ₹{po1}",
+                    "PE Entry":f"Sell {itm1} PE @ ₹{po1}",
                     "CE Target":f"Stay below ₹{otm1}","PE Target":f"Stay above ₹{itm1}",
                     "Stop Loss":f"Exit both if loss > ₹{cr*lot:,} (1× credit)",
                     "Max Profit/Lot":f"₹{cr*lot:,}","Max Loss/Lot":"Unlimited — use SL",
                     "Risk:Reward":"Credit; strict SL required",
                     "Rationale":f"Sideways. Sell {otm1} CE + {itm1} PE. Credit ₹{cr}. BE: ₹{be_lo}–₹{be_hi}."}
         else:
-            nc=max(5,(p_otm1-p_otm2)*2); w=otm1-atm; ml=max(1,w-nc); rr=round(ml/max(nc,1),1)
+            nc=max(5,(po1-po2)*2); w=otm1-atm; ml=max(1,w-nc); rr=round(ml/max(nc,1),1)
             return {"Strategy":"Iron Condor",
-                    "CE Entry":f"Sell {otm1} CE @ ₹{p_otm1} | Buy {otm2} CE @ ₹{p_otm2}",
-                    "PE Entry":f"Sell {itm1} PE @ ₹{p_otm1} | Buy {itm2} PE @ ₹{p_otm2}",
+                    "CE Entry":f"Sell {otm1} CE @ ₹{po1} | Buy {otm2} CE @ ₹{po2}",
+                    "PE Entry":f"Sell {itm1} PE @ ₹{po1} | Buy {itm2} PE @ ₹{po2}",
                     "CE Target":f"Stay below ₹{otm1}","PE Target":f"Stay above ₹{itm1}",
                     "Stop Loss":f"Exit breached side if loss > ₹{nc*2*lot:,}",
                     "Max Profit/Lot":f"₹{nc*lot:,}","Max Loss/Lot":f"₹{ml*lot:,}",
-                    "Risk:Reward":f"1:{rr}",
-                    "Rationale":f"Sideways swing. Iron Condor. Net credit ₹{nc}. Max loss ₹{ml}."}
+                    "Risk:Reward":f"1:{rr}","Rationale":f"Sideways swing. Iron Condor. Net credit ₹{nc}. Max loss ₹{ml}."}
 
-def _sv(s, k): return s.get(k,"—")
+def _sv(s,k): return s.get(k,"—")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — DATA FETCHERS
+# SECTION 7 — DATA FETCHERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class BhavcopFetcher:
-    """Equity CM bhavcopy — CMP, volume, turnover, delivery%."""
-
+    """Equity CM bhavcopy — CMP, volume, turnover."""
     def fetch(self, dt):
         url=BHAVCOPY_URL.format(date=dt.strftime("%Y%m%d"))
         log.info("Equity bhavcopy → %s",dt.strftime("%d-%b-%Y"))
-        raw=_download_raw(url,"BhavCopy")
+        raw=_download(url,"CM-Bhav")
         if raw is None: return None
         df=self._unzip(raw)
         if df is None or df.empty: return None
         df=self._filter_eq(df)
         if df.empty: return None
-
         sym_c=_pick_col(df,COL_MAP["symbol"])
         cls_c=_pick_col(df,COL_MAP["close"])
         vol_c=_pick_col(df,COL_MAP["volume"])
         tov_c=_pick_col(df,COL_MAP["turnover"])
         for c in (cls_c,vol_c,tov_c):
             df[c]=pd.to_numeric(df[c],errors="coerce")
-
-        # Delivery %
-        delv_pct_map={}
-        try:
-            dp_c=_pick_col(df,COL_MAP["delv_pct"])
-            df[dp_c]=pd.to_numeric(df[dp_c],errors="coerce")
-            delv_pct_map=dict(zip(df[sym_c].astype(str),df[dp_c].fillna(0)))
-        except Exception:
-            pass
-
         data_vol=(df.sort_values(vol_c,ascending=False).head(TOP_N)
                   [[sym_c,vol_c,cls_c]].fillna(0).values.tolist())
-        data_to=(df.sort_values(tov_c,ascending=False).head(TOP_N)
-                 [[sym_c,tov_c,cls_c]].fillna(0).values.tolist())
-        cmp_map=dict(zip(df[sym_c].astype(str),df[cls_c].fillna(0)))
+        data_to =(df.sort_values(tov_c,ascending=False).head(TOP_N)
+                  [[sym_c,tov_c,cls_c]].fillna(0).values.tolist())
+        cmp_map =dict(zip(df[sym_c].astype(str),df[cls_c].fillna(0)))
         log.info("  → %d EQ rows",len(df))
-        return data_vol, data_to, cmp_map, delv_pct_map
-
+        return data_vol,data_to,cmp_map
     def _unzip(self,raw):
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as z:
                 with z.open(z.namelist()[0]) as f:
                     return pd.read_csv(f,low_memory=False)
-        except Exception as e:
-            log.error("BhavCopy ZIP: %s",e); return None
-
+        except Exception as e: log.error("CM-Bhav ZIP: %s",e); return None
     def _filter_eq(self,df):
-        ser_c=_pick_col(df,COL_MAP["series"])
-        sym_c=_pick_col(df,COL_MAP["symbol"])
+        ser_c=_pick_col(df,COL_MAP["series"]); sym_c=_pick_col(df,COL_MAP["symbol"])
         df=df[df[ser_c].astype(str).str.strip()=="EQ"].copy()
-        mask=df[sym_c].astype(str).str.contains(EXCLUDE_PATTERN,case=False,na=False)
-        return df[~mask].reset_index(drop=True)
+        return df[~df[sym_c].astype(str).str.contains(EXCLUDE_PATTERN,case=False,na=False)].reset_index(drop=True)
+
+
+class DeliveryFetcher:
+    """
+    FIX Bug 2: Delivery % is in sec_bhavdata_full_{date}.csv — NOT in CM bhavcopy.
+    Columns include: SYMBOL, SERIES, DELIV_QTY, DELIV_PER
+    """
+    def fetch(self, ist_today) -> dict:
+        """Returns {symbol: delivery_pct_float}"""
+        for cand in _trading_days_back(ist_today, 5):
+            # NSE uses ddmmyyyy format for this file
+            url = DELIVERY_URL.format(date=cand.strftime("%d%m%Y"))
+            raw = _download(url, f"Delivery-{cand.strftime('%d%b')}")
+            if raw is None:
+                continue
+            try:
+                text = raw.decode("utf-8", errors="replace")
+                df   = pd.read_csv(io.StringIO(text))
+                df.columns = [c.strip().upper() for c in df.columns]
+                # Find symbol and delivery % columns
+                sym_c  = next((c for c in df.columns if c in ("SYMBOL","TCKRSYMB")), None)
+                ser_c  = next((c for c in df.columns if "SERIES" in c), None)
+                pct_c  = next((c for c in df.columns if "DELIV_PER" in c or "DELPCT" in c
+                               or "%DLY" in c or "DELV_PER" in c), None)
+                if not sym_c or not pct_c:
+                    log.warning("  Delivery CSV cols not found: %s", list(df.columns))
+                    continue
+                # Keep EQ series only
+                if ser_c:
+                    df = df[df[ser_c].astype(str).str.strip()=="EQ"]
+                df[pct_c] = pd.to_numeric(df[pct_c], errors="coerce")
+                result = dict(zip(df[sym_c].astype(str).str.strip(),
+                                  df[pct_c].fillna(0)))
+                log.info("  Delivery %%: %d symbols from %s", len(result), cand.strftime("%d-%b-%Y"))
+                return result
+            except Exception as e:
+                log.warning("  Delivery parse error: %s", e)
+        log.warning("  Delivery data unavailable — all '—'")
+        return {}
 
 
 class FOBhavcopFetcher:
     """
-    NSE FO bhavcopy — Open Interest per symbol and strike.
-    Returns:
-      oi_map      : {symbol: total_oi}        (CE+PE combined)
-      oi_ce_map   : {symbol: ce_oi}
-      oi_pe_map   : {symbol: pe_oi}
-      oi_by_strike: {symbol: {strike: {"CE":oi,"PE":oi}}}  for max pain
+    FIX Bug 1: FO bhavcopy for OI/PCR/Max Pain.
+    Uses NSESession (with cookie warm-up) to bypass 403.
     """
-
-    # FO bhavcopy column candidates
     FO_COL = {
         "symbol": ["TckrSymb","SYMBOL","FinInstrmNm"],
         "option": ["OptnTp","OPTION_TYP","OptionType"],
         "strike": ["StrkPric","STRIKE_PR","StrikePrice"],
         "oi":     ["OpnIntrst","OPEN_INT","OpenInterest","OI"],
-        "oi_chg": ["ChngInOpnIntrst","CHG_IN_OI","ChangeInOI"],
         "expiry": ["XpryDt","EXPIRY_DT","ExpiryDate"],
     }
-
     def fetch(self, dt):
         url=FO_BHAV_URL.format(date=dt.strftime("%Y%m%d"))
         log.info("FO bhavcopy → %s",dt.strftime("%d-%b-%Y"))
-        raw=_download_raw(url,"FOBhav")
+        raw=_download(url,"FO-Bhav")
         if raw is None: return {},{},{},{}
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as z:
@@ -610,116 +609,97 @@ class FOBhavcopFetcher:
             df[opt_c]=df[opt_c].astype(str).str.strip().str.upper()
             df[str_c]=pd.to_numeric(df[str_c],errors="coerce")
             df[oi_c] =pd.to_numeric(df[oi_c], errors="coerce").fillna(0)
-
-            # Keep only near-month expiry (min expiry date)
+            # Keep near-month expiry only
             try:
                 exp_c=_pick_col(df,self.FO_COL["expiry"])
                 df[exp_c]=pd.to_datetime(df[exp_c],errors="coerce")
-                min_exp=df[exp_c].min()
-                df=df[df[exp_c]==min_exp]
-            except Exception:
-                pass
-
-            oi_ce_map, oi_pe_map, oi_by_strike = {},{},{}
+                df=df[df[exp_c]==df[exp_c].min()]
+            except Exception: pass
+            oi_ce,oi_pe,oi_by={},{},{}
             for _,row in df.iterrows():
-                sym=row[sym_c]; opt=row[opt_c]
-                strike=row[str_c]; oi=row[oi_c]
+                sym=row[sym_c]; opt=row[opt_c]; strike=row[str_c]; oi=row[oi_c]
                 if opt=="CE":
-                    oi_ce_map[sym]=oi_ce_map.get(sym,0)+oi
-                    oi_by_strike.setdefault(sym,{}).setdefault(strike,{"CE":0,"PE":0})
-                    oi_by_strike[sym][strike]["CE"]+=oi
+                    oi_ce[sym]=oi_ce.get(sym,0)+oi
+                    oi_by.setdefault(sym,{}).setdefault(strike,{"CE":0,"PE":0})
+                    oi_by[sym][strike]["CE"]+=oi
                 elif opt=="PE":
-                    oi_pe_map[sym]=oi_pe_map.get(sym,0)+oi
-                    oi_by_strike.setdefault(sym,{}).setdefault(strike,{"CE":0,"PE":0})
-                    oi_by_strike[sym][strike]["PE"]+=oi
-
-            oi_map={sym:oi_ce_map.get(sym,0)+oi_pe_map.get(sym,0)
-                    for sym in set(list(oi_ce_map)+list(oi_pe_map))}
-            log.info("  → FO OI loaded: %d symbols",len(oi_map))
-            return oi_map, oi_ce_map, oi_pe_map, oi_by_strike
+                    oi_pe[sym]=oi_pe.get(sym,0)+oi
+                    oi_by.setdefault(sym,{}).setdefault(strike,{"CE":0,"PE":0})
+                    oi_by[sym][strike]["PE"]+=oi
+            oi_map={s:oi_ce.get(s,0)+oi_pe.get(s,0) for s in set(list(oi_ce)+list(oi_pe))}
+            log.info("  → FO OI: %d symbols",len(oi_map))
+            return oi_map,oi_ce,oi_pe,oi_by
         except Exception as e:
-            log.warning("FOBhav parse: %s",e)
-            return {},{},{},{}
+            log.warning("FO-Bhav parse: %s",e); return {},{},{},{}
 
 
 class IndexPriceFetcher:
-    """Index closing prices + India VIX from ind_close_all CSV."""
-
+    """Index CMP + India VIX from ind_close_all CSV."""
     def fetch(self, ist_today):
-        for days_back in range(LOOKBACK_DAYS+1):
-            cand=ist_today-timedelta(days=days_back)
-            if cand.weekday()>=5: continue
-            data=self._fetch_one(cand)
+        for cand in _trading_days_back(ist_today, LOOKBACK_DAYS):
+            data=self._one(cand)
             if data:
                 log.info("Index prices %s: %s",cand.strftime("%d-%b-%Y"),
                          {k:f"₹{v:,.0f}" for k,v in data.items() if k!="VIX"})
                 return data
-        log.warning("Index CSV unavailable — using fallback prices.")
+        log.warning("Index CSV unavailable — fallback prices")
         return dict(INDEX_FALLBACK_CMP)
-
     def fetch_history(self, ist_today, days=HISTORY_DAYS):
         history,found={},0
-        for days_back in range(1, days+15):
-            cand=ist_today-timedelta(days=days_back)
-            if cand.weekday()>=5: continue
-            dd=self._fetch_one(cand)
+        for cand in _trading_days_back(ist_today, days+15):
+            dd=self._one(cand)
             if not dd: continue
             for sym,price in dd.items():
                 history.setdefault(sym,[]).append(price)
             found+=1
             if found>=days: break
         return {s:list(reversed(v)) for s,v in history.items()}
-
-    def _fetch_one(self, dt):
+    def _one(self, dt):
         url=INDEX_CSV_URL.format(date=dt.strftime("%d%m%Y"))
-        raw=_download_raw(url,"IndexCSV")
+        raw=_download(url,f"IndexCSV-{dt.strftime('%d%b')}")
         if raw is None: return {}
         try:
             df=pd.read_csv(io.StringIO(raw.decode("utf-8",errors="replace")))
             df.columns=[c.strip() for c in df.columns]
-            name_col=next((c for c in df.columns if "index" in c.lower() and "name" in c.lower()),None)
-            close_col=next((c for c in df.columns if "clos" in c.lower()),None)
-            if not name_col or not close_col: return {}
-            df[close_col]=pd.to_numeric(df[close_col].astype(str).str.replace(",",""),errors="coerce")
+            nc=next((c for c in df.columns if "index" in c.lower() and "name" in c.lower()),None)
+            cc=next((c for c in df.columns if "clos" in c.lower()),None)
+            if not nc or not cc: return {}
+            df[cc]=pd.to_numeric(df[cc].astype(str).str.replace(",",""),errors="coerce")
             result={}
             for _,row in df.iterrows():
-                raw_name=str(row[name_col]).strip()
-                sym=INDEX_NAME_MAP.get(raw_name) or INDEX_NAME_MAP.get(raw_name.title())
-                if sym and pd.notna(row[close_col]) and row[close_col]>0:
-                    result[sym]=float(row[close_col])
+                sym=INDEX_NAME_MAP.get(str(row[nc]).strip()) or INDEX_NAME_MAP.get(str(row[nc]).strip().title())
+                if sym and pd.notna(row[cc]) and row[cc]>0:
+                    result[sym]=float(row[cc])
             for sym,fb in INDEX_FALLBACK_CMP.items():
                 if sym not in result: result[sym]=fb
             return result
-        except Exception as e:
-            log.warning("IndexCSV parse: %s",e); return {}
+        except Exception as e: log.warning("IndexCSV: %s",e); return {}
 
 
 class Week52Fetcher:
-    """52-week High/Low from NSE CSV."""
-
-    def fetch(self):
-        raw=_download_raw(WEEK52_URL,"52wk")
+    """FIX Bug 3: 52-week High/Low — uses NSESession cookies."""
+    def fetch(self) -> tuple:
+        raw=_download(WEEK52_URL,"52wk")
         if raw is None: return {},{}
         try:
             df=pd.read_csv(io.StringIO(raw.decode("utf-8",errors="replace")))
             df.columns=[c.strip() for c in df.columns]
             sym_c=next((c for c in df.columns if "symbol" in c.lower()),None)
-            hi_c =next((c for c in df.columns if "high" in c.lower()),None)
-            lo_c =next((c for c in df.columns if "low"  in c.lower()),None)
-            if not all([sym_c,hi_c,lo_c]): return {},{}
+            hi_c =next((c for c in df.columns if "high"   in c.lower()),None)
+            lo_c =next((c for c in df.columns if "low"    in c.lower()),None)
+            if not all([sym_c,hi_c,lo_c]):
+                log.warning("  52wk cols not found: %s",list(df.columns)); return {},{}
             df[hi_c]=pd.to_numeric(df[hi_c],errors="coerce")
             df[lo_c]=pd.to_numeric(df[lo_c],errors="coerce")
-            hi_map=dict(zip(df[sym_c].astype(str).str.strip(),df[hi_c].fillna(0)))
-            lo_map=dict(zip(df[sym_c].astype(str).str.strip(),df[lo_c].fillna(0)))
-            log.info("52wk High/Low: %d symbols",len(hi_map))
-            return hi_map, lo_map
-        except Exception as e:
-            log.warning("52wk parse: %s",e); return {},{}
+            hi=dict(zip(df[sym_c].astype(str).str.strip(),df[hi_c].fillna(0)))
+            lo=dict(zip(df[sym_c].astype(str).str.strip(),df[lo_c].fillna(0)))
+            log.info("  52wk: %d symbols",len(hi)); return hi,lo
+        except Exception as e: log.warning("52wk: %s",e); return {},{}
 
 
 class LotSizeFetcher:
     def fetch(self):
-        raw=_download_raw(MKTLOTS_URL,"LotSizes")
+        raw=_download(MKTLOTS_URL,"LotSizes")
         if raw is None: return {}
         try:
             df=pd.read_csv(io.StringIO(raw.decode("utf-8",errors="replace")),header=1,dtype=str)
@@ -729,327 +709,168 @@ class LotSizeFetcher:
             df[lc]=pd.to_numeric(df[lc].str.replace(",",""),errors="coerce")
             result=dict(zip(df[sc].dropna(),df[lc].dropna().astype(int)))
             log.info("Lot sizes: %d symbols",len(result)); return result
-        except Exception as e:
-            log.warning("LotSizes: %s",e); return {}
+        except Exception as e: log.warning("LotSizes: %s",e); return {}
 
 
 class EquityHistoryFetcher:
+    """FIX Bug 4: HISTORY_DAYS=35, fetch up to 50 calendar days back."""
     def fetch(self, ist_today, days=HISTORY_DAYS):
         history,fetcher,found={},BhavcopFetcher(),0
-        for days_back in range(1,days+15):
-            cand=ist_today-timedelta(days=days_back)
-            if cand.weekday()>=5: continue
+        for cand in _trading_days_back(ist_today, days+15):
             res=fetcher.fetch(cand)
             if not res: continue
-            _,_,cmap,_=res
+            _,_,cmap=res
             for sym,cls in cmap.items():
                 if cls and cls>0: history.setdefault(sym,[]).append(cls)
             found+=1
             if found>=days: break
-        return {s:list(reversed(v)) for s,v in history.items()}
+        result={s:list(reversed(v)) for s,v in history.items()}
+        log.info("  Equity history: %d symbols × up to %d days",len(result),days)
+        return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — SHEET HEADERS
+# SECTION 8 — SHEET HEADERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── 12 NEW analytics columns (appended to both sheets before Notes) ──────────
-ANALYTICS_HEADERS = [
-    "Open Interest\n(OI — Lots)",           # A1
-    "OI Change\n(vs Prev Day)",              # A2
-    "PCR\n(Put-Call Ratio)",                 # A3
-    "52-Week\nHigh ₹",                       # A4
-    "52-Week\nLow ₹",                        # A5
-    "Delivery\n%",                           # A6
-    "India\nVIX",                            # A7
-    "IV %\n(Impl. Volatility)",              # A8
-    "Max Pain\nStrike ₹",                    # A9
-    "Support\n₹",                            # A10
-    "Resistance\n₹",                         # A11
-    "Beta\nvs Nifty",                        # A12
-    "RSI\n(14-day)",                         # A13
-    "MACD Signal\n(12/26/9)",               # A14
-]   # 14 analytics columns
-
-# OPTIONS F&O — 40 base + 14 analytics + 1 Notes = 55 columns
 OPT_HEADERS = [
-    "Sr.",                                        # 1
-    "Company / Index Name",                       # 2
-    "NSE Symbol",                                 # 3
-    "Sector / Type",                              # 4
-    "Lot Size\n(Units)",                          # 5
-    "CMP ₹\n(Approx.)",                          # 6
-    "Contract\nValue ₹",                          # 7
-    "Near-Month\nExpiry",                         # 8
-    "Mid-Month\nExpiry",                          # 9
-    "Far-Month\nExpiry",                          # 10
-    "Approx.\nATM Call ₹\n(Near Expiry)",        # 11
-    "Approx.\nATM Put ₹\n(Near Expiry)",         # 12
-    "Call Premium\nPaid (1 Lot) ₹",              # 13
-    "Put Premium\nPaid (1 Lot) ₹",               # 14
-    "Option Seller\nMargin ₹\n(~20% Contract)",  # 15
-    "Intraday\nTrend",                            # 16
-    "Swing\nTrend",                               # 17
-    "Options Strategy\n(Intraday)",               # 18
-    "Options Strategy\n(Swing)",                  # 19
-    "Intraday Signal:\nBest Strategy",            # 20
-    "Intraday:\nCE Entry",                        # 21
-    "Intraday:\nPE Entry",                        # 22
-    "Intraday:\nCE Target",                       # 23
-    "Intraday:\nPE Target",                       # 24
-    "Intraday:\nStop Loss",                       # 25
-    "Intraday:\nMax Profit/Lot ₹",               # 26
-    "Intraday:\nMax Loss/Lot ₹",                 # 27
-    "Intraday:\nRisk:Reward",                     # 28
-    "Intraday:\nRationale",                       # 29
-    "Swing Signal:\nBest Strategy",               # 30
-    "Swing:\nCE Entry",                           # 31
-    "Swing:\nPE Entry",                           # 32
-    "Swing:\nCE Target",                          # 33
-    "Swing:\nPE Target",                          # 34
-    "Swing:\nStop Loss",                          # 35
-    "Swing:\nMax Profit/Lot ₹",                  # 36
-    "Swing:\nMax Loss/Lot ₹",                    # 37
-    "Swing:\nRisk:Reward",                        # 38
-    "Swing:\nRationale",                          # 39
-    # ── 14 analytics ─────────────────────────────────────────────────
-    "Open Interest\n(OI — Lots)",                # 40
-    "OI Change\n(vs Prev Day)",                  # 41
-    "PCR\n(Put-Call Ratio)",                     # 42
-    "52-Week\nHigh ₹",                           # 43
-    "52-Week\nLow ₹",                            # 44
-    "Delivery\n%",                               # 45
-    "India\nVIX",                                # 46
-    "IV %\n(Impl. Volatility)",                  # 47
-    "Max Pain\nStrike ₹",                        # 48
-    "Support\n₹",                                # 49
-    "Resistance\n₹",                             # 50
-    "Beta\nvs Nifty",                            # 51
-    "RSI\n(14-day)",                             # 52
-    "MACD Signal\n(12/26/9)",                   # 53
-    "Notes",                                      # 54
-]   # total = 54
+    "Sr.","Company / Index Name","NSE Symbol","Sector / Type",
+    "Lot Size\n(Units)","CMP ₹\n(Approx.)","Contract\nValue ₹",
+    "Near-Month\nExpiry","Mid-Month\nExpiry","Far-Month\nExpiry",
+    "Approx.\nATM Call ₹\n(Near Expiry)","Approx.\nATM Put ₹\n(Near Expiry)",
+    "Call Premium\nPaid (1 Lot) ₹","Put Premium\nPaid (1 Lot) ₹",
+    "Option Seller\nMargin ₹\n(~20% Contract)",
+    "Intraday\nTrend","Swing\nTrend",
+    "Options Strategy\n(Intraday)","Options Strategy\n(Swing)",
+    "Intraday Signal:\nBest Strategy","Intraday:\nCE Entry","Intraday:\nPE Entry",
+    "Intraday:\nCE Target","Intraday:\nPE Target","Intraday:\nStop Loss",
+    "Intraday:\nMax Profit/Lot ₹","Intraday:\nMax Loss/Lot ₹",
+    "Intraday:\nRisk:Reward","Intraday:\nRationale",
+    "Swing Signal:\nBest Strategy","Swing:\nCE Entry","Swing:\nPE Entry",
+    "Swing:\nCE Target","Swing:\nPE Target","Swing:\nStop Loss",
+    "Swing:\nMax Profit/Lot ₹","Swing:\nMax Loss/Lot ₹",
+    "Swing:\nRisk:Reward","Swing:\nRationale",
+    # 14 analytics
+    "Open Interest\n(OI — Lots)","OI Change\n(vs Prev Day)",
+    "PCR\n(Put-Call Ratio)","52-Week\nHigh ₹","52-Week\nLow ₹",
+    "Delivery\n%","India\nVIX","IV %\n(Impl. Volatility)",
+    "Max Pain\nStrike ₹","Support\n₹","Resistance\n₹",
+    "Beta\nvs Nifty","RSI\n(14-day)","MACD Signal\n(12/26/9)",
+    "Notes",
+]   # 54 columns
 
-# FUTURES F&O — 35 base + 14 analytics + 1 Notes + 1 Last Updated = 51 columns
 FUT_HEADERS = [
-    "Sr.",                                        # 1
-    "Company / Index Name",                       # 2
-    "NSE Symbol",                                 # 3
-    "Sector / Type",                              # 4
-    "Lot Size\n(Units)",                          # 5
-    "CMP ₹\n(Approx.)",                          # 6
-    "Contract\nValue ₹",                          # 7
-    "Futures\nMargin %",                          # 8
-    "Futures\nMargin Req. ₹",                    # 9
-    "Near-Month\nExpiry",                         # 10
-    "Mid-Month\nExpiry",                          # 11
-    "Far-Month\nExpiry",                          # 12
-    "Intraday\nTrend",                            # 13
-    "Swing\nTrend",                               # 14
-    "Intraday Signal:\nBest Strategy",            # 15
-    "Intraday:\nCE Entry",                        # 16
-    "Intraday:\nPE Entry",                        # 17
-    "Intraday:\nCE Target",                       # 18
-    "Intraday:\nPE Target",                       # 19
-    "Intraday:\nStop Loss",                       # 20
-    "Intraday:\nMax Profit/Lot ₹",               # 21
-    "Intraday:\nMax Loss/Lot ₹",                 # 22
-    "Intraday:\nRisk:Reward",                     # 23
-    "Intraday:\nRationale",                       # 24
-    "Swing Signal:\nBest Strategy",               # 25
-    "Swing:\nCE Entry",                           # 26
-    "Swing:\nPE Entry",                           # 27
-    "Swing:\nCE Target",                          # 28
-    "Swing:\nPE Target",                          # 29
-    "Swing:\nStop Loss",                          # 30
-    "Swing:\nMax Profit/Lot ₹",                  # 31
-    "Swing:\nMax Loss/Lot ₹",                    # 32
-    "Swing:\nRisk:Reward",                        # 33
-    "Swing:\nRationale",                          # 34
-    # ── 14 analytics ─────────────────────────────────────────────────
-    "Open Interest\n(OI — Lots)",                # 35
-    "OI Change\n(vs Prev Day)",                  # 36
-    "PCR\n(Put-Call Ratio)",                     # 37
-    "52-Week\nHigh ₹",                           # 38
-    "52-Week\nLow ₹",                            # 39
-    "Delivery\n%",                               # 40
-    "India\nVIX",                                # 41
-    "IV %\n(Impl. Volatility)",                  # 42
-    "Max Pain\nStrike ₹",                        # 43
-    "Support\n₹",                                # 44
-    "Resistance\n₹",                             # 45
-    "Beta\nvs Nifty",                            # 46
-    "RSI\n(14-day)",                             # 47
-    "MACD Signal\n(12/26/9)",                   # 48
-    "Notes",                                      # 49
-    "Last Updated",                               # 50
-]   # total = 50
+    "Sr.","Company / Index Name","NSE Symbol","Sector / Type",
+    "Lot Size\n(Units)","CMP ₹\n(Approx.)","Contract\nValue ₹",
+    "Futures\nMargin %","Futures\nMargin Req. ₹",
+    "Near-Month\nExpiry","Mid-Month\nExpiry","Far-Month\nExpiry",
+    "Intraday\nTrend","Swing\nTrend",
+    "Intraday Signal:\nBest Strategy","Intraday:\nCE Entry","Intraday:\nPE Entry",
+    "Intraday:\nCE Target","Intraday:\nPE Target","Intraday:\nStop Loss",
+    "Intraday:\nMax Profit/Lot ₹","Intraday:\nMax Loss/Lot ₹",
+    "Intraday:\nRisk:Reward","Intraday:\nRationale",
+    "Swing Signal:\nBest Strategy","Swing:\nCE Entry","Swing:\nPE Entry",
+    "Swing:\nCE Target","Swing:\nPE Target","Swing:\nStop Loss",
+    "Swing:\nMax Profit/Lot ₹","Swing:\nMax Loss/Lot ₹",
+    "Swing:\nRisk:Reward","Swing:\nRationale",
+    # 14 analytics
+    "Open Interest\n(OI — Lots)","OI Change\n(vs Prev Day)",
+    "PCR\n(Put-Call Ratio)","52-Week\nHigh ₹","52-Week\nLow ₹",
+    "Delivery\n%","India\nVIX","IV %\n(Impl. Volatility)",
+    "Max Pain\nStrike ₹","Support\n₹","Resistance\n₹",
+    "Beta\nvs Nifty","RSI\n(14-day)","MACD Signal\n(12/26/9)",
+    "Notes","Last Updated",
+]   # 50 columns
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — ROW BUILDERS
+# SECTION 9 — ROW BUILDERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _analytics_block(
-    sym, ltp, lot, atm_prem,
-    oi_map, oi_ce_map, oi_pe_map, oi_by_strike,
-    prev_oi_map,
-    wk52_hi, wk52_lo,
-    delv_pct_map,
-    india_vix,
-    equity_hist, nifty_hist,
-):
-    """
-    Build the 14-item analytics list for one symbol.
-    All values gracefully degrade to '—' if data unavailable.
-    """
-    # OI
-    oi     = oi_map.get(sym, 0)
-    oi_ce  = oi_ce_map.get(sym, 0)
-    oi_pe  = oi_pe_map.get(sym, 0)
-    prev   = prev_oi_map.get(sym, 0)
-    oi_chg = (oi - prev) if (oi > 0 and prev > 0) else None
-
-    # PCR
-    pcr = round(oi_pe/oi_ce, 2) if oi_ce > 0 else None
-    pcr_str = f"{pcr}" if pcr else "—"
+def _analytics_block(sym,ltp,lot,oi_map,oi_ce,oi_pe,oi_by,prev_oi,
+                     wk52_hi,wk52_lo,delv_map,india_vix,equity_hist,nifty_hist):
+    oi    =oi_map.get(sym,0)
+    oi_ce_=oi_ce.get(sym,0)
+    oi_pe_=oi_pe.get(sym,0)
+    prev  =prev_oi.get(sym,0)
+    oi_chg=(oi-prev) if (oi>0 and prev>0) else None
+    pcr   =round(oi_pe_/oi_ce_,2) if oi_ce_>0 else None
     if pcr:
-        if pcr > 1.2:   pcr_str = f"{pcr} 🟢 Bullish"
-        elif pcr < 0.8: pcr_str = f"{pcr} 🔴 Bearish"
-        else:           pcr_str = f"{pcr} 🟡 Neutral"
-
-    # 52-week
-    hi52 = wk52_hi.get(sym, 0) or None
-    lo52 = wk52_lo.get(sym, 0) or None
-
-    # Delivery %
-    dlv = delv_pct_map.get(sym, 0) or None
-    dlv_str = f"{dlv:.1f}%" if dlv else "—"
-
-    # India VIX
-    vix_str = f"{india_vix:.2f}" if india_vix else "—"
-
-    # IV back-solved
-    iv_str = _calc_iv(ltp, atm_prem) if ltp > 0 else "—"
-
-    # Max Pain
-    mp = _calc_max_pain(oi_by_strike.get(sym, {}))
-    mp_str = f"₹{mp:,}" if mp else "—"
-
-    # Support / Resistance
-    hist  = equity_hist.get(sym, [])
-    sup, res = _calc_support_resistance(hist)
-    sup_str = f"₹{sup:,.2f}" if sup else "—"
-    res_str = f"₹{res:,.2f}" if res else "—"
-
-    # Beta
-    beta = _calc_beta(hist, nifty_hist) if (hist and nifty_hist) else None
-    beta_str = str(beta) if beta is not None else "—"
-
-    # RSI
-    rsi = _calc_rsi(hist)
-    rsi_str = _rsi_label(rsi)
-
-    # MACD
-    _, _, _, macd_label = _calc_macd(hist)
-
+        pcr_s=f"{pcr} 🟢 Bullish" if pcr>1.2 else f"{pcr} 🔴 Bearish" if pcr<0.8 else f"{pcr} 🟡 Neutral"
+    else: pcr_s="—"
+    hi52  =wk52_hi.get(sym) or None
+    lo52  =wk52_lo.get(sym) or None
+    dlv   =delv_map.get(sym,0) or None
+    vix_s =f"{india_vix:.2f}" if india_vix else "—"
+    atm_p =_atm_premium(ltp)
+    iv_s  =_calc_iv(ltp,atm_p) if ltp>0 else "—"
+    mp    =_calc_max_pain(oi_by.get(sym,{}))
+    hist  =equity_hist.get(sym,[])
+    sup,res=_calc_support_resistance(hist)
+    beta  =_calc_beta(hist,nifty_hist) if (hist and nifty_hist) else None
+    rsi   =_calc_rsi(hist)
+    _,_,_,macd_label=_calc_macd(hist)
     return [
-        int(oi)     if oi else "—",          # OI
-        int(oi_chg) if oi_chg is not None else "—",  # OI Change
-        pcr_str,                              # PCR
-        hi52 if hi52 else "—",               # 52wk High
-        lo52 if lo52 else "—",               # 52wk Low
-        dlv_str,                              # Delivery %
-        vix_str,                              # India VIX
-        iv_str,                               # IV %
-        mp_str,                               # Max Pain
-        sup_str,                              # Support
-        res_str,                              # Resistance
-        beta_str,                             # Beta
-        rsi_str,                              # RSI
-        macd_label,                           # MACD
+        int(oi)      if oi      else "—",
+        int(oi_chg)  if oi_chg is not None else "—",
+        pcr_s,
+        round(hi52,2) if hi52  else "—",
+        round(lo52,2) if lo52  else "—",
+        f"{dlv:.1f}%" if dlv   else "—",
+        vix_s,
+        iv_s,
+        f"₹{mp:,}"   if mp     else "—",
+        f"₹{sup:,.2f}" if sup  else "—",
+        f"₹{res:,.2f}" if res  else "—",
+        str(beta)    if beta is not None else "—",
+        _rsi_label(rsi),
+        macd_label,
     ]   # 14 items
 
+def _build_opt_row(sr,name,sym,sector,lot,ltp,expiries,history,analytics,note=""):
+    en,em,ef=expiries; hist=history.get(sym,[])
+    it=_trend(hist[-5:] if len(hist)>=5 else hist); st=_trend(hist)
+    cval=round(lot*ltp); ac=_atm_premium(ltp); ap=_atm_premium(ltp)
+    si=_strategy_engine(ltp,ac,it,st,lot,"intraday")
+    ss=_strategy_engine(ltp,ac,it,st,lot,"swing")
+    return ([sr,name,sym,sector,lot,round(ltp,2),cval,en,em,ef,
+             ac,ap,ac*lot,ap*lot,round(cval*0.20),
+             _trend_label(it),_trend_label(st),si["Strategy"],ss["Strategy"],
+             si["Strategy"],_sv(si,"CE Entry"),_sv(si,"PE Entry"),
+             _sv(si,"CE Target"),_sv(si,"PE Target"),_sv(si,"Stop Loss"),
+             _sv(si,"Max Profit/Lot"),_sv(si,"Max Loss/Lot"),_sv(si,"Risk:Reward"),_sv(si,"Rationale"),
+             ss["Strategy"],_sv(ss,"CE Entry"),_sv(ss,"PE Entry"),
+             _sv(ss,"CE Target"),_sv(ss,"PE Target"),_sv(ss,"Stop Loss"),
+             _sv(ss,"Max Profit/Lot"),_sv(ss,"Max Loss/Lot"),_sv(ss,"Risk:Reward"),_sv(ss,"Rationale"),
+            ] + analytics + [note])  # 39+14+1 = 54
 
-def _build_opt_row(sr, name, sym, sector, lot, ltp, expiries, history,
-                   analytics, note=""):
-    """Build one Options F&O row — 54 items."""
-    exp_near,exp_mid,exp_far=expiries
-    hist   =history.get(sym,[])
-    intra_t=_trend(hist[-5:] if len(hist)>=5 else hist)
-    swing_t=_trend(hist)
-    cval   =round(lot*ltp)
-    atm_c  =_atm_premium(ltp)
-    atm_p  =_atm_premium(ltp)
-    si=_strategy_engine(ltp,atm_c,intra_t,swing_t,lot,"intraday")
-    ss=_strategy_engine(ltp,atm_c,intra_t,swing_t,lot,"swing")
-    return [
-        sr,name,sym,sector,lot,round(ltp,2),cval,
-        exp_near,exp_mid,exp_far,
-        atm_c,atm_p,atm_c*lot,atm_p*lot,round(cval*0.20),
-        _trend_label(intra_t),_trend_label(swing_t),
-        si["Strategy"],ss["Strategy"],
-        si["Strategy"],_sv(si,"CE Entry"),_sv(si,"PE Entry"),
-        _sv(si,"CE Target"),_sv(si,"PE Target"),_sv(si,"Stop Loss"),
-        _sv(si,"Max Profit/Lot"),_sv(si,"Max Loss/Lot"),_sv(si,"Risk:Reward"),
-        _sv(si,"Rationale"),
-        ss["Strategy"],_sv(ss,"CE Entry"),_sv(ss,"PE Entry"),
-        _sv(ss,"CE Target"),_sv(ss,"PE Target"),_sv(ss,"Stop Loss"),
-        _sv(ss,"Max Profit/Lot"),_sv(ss,"Max Loss/Lot"),_sv(ss,"Risk:Reward"),
-        _sv(ss,"Rationale"),
-    ] + analytics + [note]   # 39 + 14 + 1 = 54
+def _build_fut_row(sr,name,sym,sector,lot,ltp,mp,expiries,history,analytics,note=""):
+    en,em,ef=expiries; hist=history.get(sym,[])
+    it=_trend(hist[-5:] if len(hist)>=5 else hist); st=_trend(hist)
+    cval=round(lot*ltp); ac=_atm_premium(ltp)
+    si=_strategy_engine(ltp,ac,it,st,lot,"intraday")
+    ss=_strategy_engine(ltp,ac,it,st,lot,"swing")
+    return ([sr,name,sym,sector,lot,round(ltp,2),cval,
+             f"{mp}%",round(cval*mp/100),en,em,ef,
+             _trend_label(it),_trend_label(st),
+             si["Strategy"],_sv(si,"CE Entry"),_sv(si,"PE Entry"),
+             _sv(si,"CE Target"),_sv(si,"PE Target"),_sv(si,"Stop Loss"),
+             _sv(si,"Max Profit/Lot"),_sv(si,"Max Loss/Lot"),_sv(si,"Risk:Reward"),_sv(si,"Rationale"),
+             ss["Strategy"],_sv(ss,"CE Entry"),_sv(ss,"PE Entry"),
+             _sv(ss,"CE Target"),_sv(ss,"PE Target"),_sv(ss,"Stop Loss"),
+             _sv(ss,"Max Profit/Lot"),_sv(ss,"Max Loss/Lot"),_sv(ss,"Risk:Reward"),_sv(ss,"Rationale"),
+            ] + analytics + [note,_ist_now()])  # 34+14+2 = 50
 
-
-def _build_fut_row(sr, name, sym, sector, lot, ltp, margin_pct, expiries,
-                   history, analytics, note=""):
-    """Build one Futures F&O row — 50 items."""
-    exp_near,exp_mid,exp_far=expiries
-    hist   =history.get(sym,[])
-    intra_t=_trend(hist[-5:] if len(hist)>=5 else hist)
-    swing_t=_trend(hist)
-    cval   =round(lot*ltp)
-    atm_c  =_atm_premium(ltp)
-    si=_strategy_engine(ltp,atm_c,intra_t,swing_t,lot,"intraday")
-    ss=_strategy_engine(ltp,atm_c,intra_t,swing_t,lot,"swing")
-    return [
-        sr,name,sym,sector,lot,round(ltp,2),cval,
-        f"{margin_pct}%",round(cval*margin_pct/100),
-        exp_near,exp_mid,exp_far,
-        _trend_label(intra_t),_trend_label(swing_t),
-        si["Strategy"],_sv(si,"CE Entry"),_sv(si,"PE Entry"),
-        _sv(si,"CE Target"),_sv(si,"PE Target"),_sv(si,"Stop Loss"),
-        _sv(si,"Max Profit/Lot"),_sv(si,"Max Loss/Lot"),_sv(si,"Risk:Reward"),
-        _sv(si,"Rationale"),
-        ss["Strategy"],_sv(ss,"CE Entry"),_sv(ss,"PE Entry"),
-        _sv(ss,"CE Target"),_sv(ss,"PE Target"),_sv(ss,"Stop Loss"),
-        _sv(ss,"Max Profit/Lot"),_sv(ss,"Max Loss/Lot"),_sv(ss,"Risk:Reward"),
-        _sv(ss,"Rationale"),
-    ] + analytics + [note, _ist_now()]   # 34 + 14 + 2 = 50
-
-
-def build_all_rows(
-    lot_sizes, equity_cmp, index_cmp,
-    equity_hist, index_hist,
-    oi_map, oi_ce_map, oi_pe_map, oi_by_strike,
-    prev_oi_map,
-    wk52_hi, wk52_lo,
-    delv_pct_map,
-    expiries,
-):
+def build_all_rows(lot_sizes,equity_cmp,index_cmp,equity_hist,index_hist,
+                   oi_map,oi_ce,oi_pe,oi_by,prev_oi,wk52_hi,wk52_lo,
+                   delv_map,expiries):
     fut_rows,opt_rows,sr=[],[],1
-    nifty_hist=index_hist.get("NIFTY", equity_hist.get("NIFTY",[]))
-    india_vix=index_cmp.get("VIX", None)
-
-    def _ana(sym, ltp, lot):
-        atm_p=_atm_premium(ltp)
-        return _analytics_block(
-            sym, ltp, lot, atm_p,
-            oi_map, oi_ce_map, oi_pe_map, oi_by_strike,
-            prev_oi_map, wk52_hi, wk52_lo, delv_pct_map,
-            india_vix, equity_hist, nifty_hist,
-        )
-
-    # ── INDICES ──────────────────────────────────────────────────────────────
+    nifty_hist=index_hist.get("NIFTY") or equity_hist.get("NIFTY",[])
+    india_vix =index_cmp.get("VIX")
+    def ana(sym,ltp,lot):
+        return _analytics_block(sym,ltp,lot,oi_map,oi_ce,oi_pe,oi_by,prev_oi,
+                                wk52_hi,wk52_lo,delv_map,india_vix,equity_hist,nifty_hist)
+    # Indices first
     log.info("Building index rows…")
     for sym,name,sector,margin_pct in INDEX_META:
         lot=lot_sizes.get(sym,FALLBACK_LOTS.get(sym,0))
@@ -1058,182 +879,141 @@ def build_all_rows(
         if ltp==0: ltp=INDEX_FALLBACK_CMP.get(sym,0)
         if ltp==0: continue
         hist=index_hist.get(sym) or equity_hist.get(sym,[])
-        h   ={sym:hist}
-        ana =_ana(sym,ltp,lot)
-        fut_rows.append(_build_fut_row(sr,name,sym,sector,lot,ltp,margin_pct,expiries,h,ana,"Index Future"))
-        opt_rows.append(_build_opt_row(sr,name,sym,sector,lot,ltp,expiries,h,ana,"Index Option"))
-        log.info("  %-12s CMP=₹%-8s Lot=%-4d",sym,f"{ltp:,.0f}",lot)
+        h={sym:hist}; a=ana(sym,ltp,lot)
+        fut_rows.append(_build_fut_row(sr,name,sym,sector,lot,ltp,margin_pct,expiries,h,a,"Index Future"))
+        opt_rows.append(_build_opt_row(sr,name,sym,sector,lot,ltp,expiries,h,a,"Index Option"))
+        log.info("  %-12s CMP=₹%-8s Lot=%d",sym,f"{ltp:,.0f}",lot)
         sr+=1
-
-    # ── STOCKS ───────────────────────────────────────────────────────────────
+    # Stocks
     log.info("Building stock rows…")
     skipped=0
     for sym in sorted((set(lot_sizes)|set(FALLBACK_LOTS))-INDEX_SYMS):
         lot=lot_sizes.get(sym,FALLBACK_LOTS.get(sym,0))
         ltp=equity_cmp.get(sym,0)
         if lot==0 or ltp==0: skipped+=1; continue
-        sector=SECTOR_MAP.get(sym,"Equity")
-        ana=_ana(sym,ltp,lot)
-        fut_rows.append(_build_fut_row(sr,sym,sym,sector,lot,ltp,20,expiries,equity_hist,ana))
-        opt_rows.append(_build_opt_row(sr,sym,sym,sector,lot,ltp,expiries,equity_hist,ana))
+        a=ana(sym,ltp,lot)
+        fut_rows.append(_build_fut_row(sr,sym,sym,SECTOR_MAP.get(sym,"Equity"),lot,ltp,20,expiries,equity_hist,a))
+        opt_rows.append(_build_opt_row(sr,sym,sym,SECTOR_MAP.get(sym,"Equity"),lot,ltp,expiries,equity_hist,a))
         sr+=1
-
-    log.info("Rows — Futures:%d  Options:%d  Skipped:%d",
-             len(fut_rows),len(opt_rows),skipped)
+    log.info("Rows — Futures:%d  Options:%d  Skipped:%d",len(fut_rows),len(opt_rows),skipped)
     return fut_rows,opt_rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — GOOGLE SHEETS WRITER
+# SECTION 10 — GOOGLE SHEETS WRITER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SheetsWriter:
-    def __init__(self, creds_json):
-        creds=ServiceAccountCredentials.from_json_keyfile_dict(
-            json.loads(creds_json),GSHEETS_SCOPES)
+    def __init__(self,creds_json):
+        creds=ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json),GSHEETS_SCOPES)
         self._client=gspread.authorize(creds)
-
-    def _get_or_create(self, ss, title, cols=60):
-        try:
-            return ss.worksheet(title)
+    def _get_or_create(self,ss,title,cols=60):
+        try: return ss.worksheet(title)
         except gspread.WorksheetNotFound:
             log.info("Creating tab: '%s'",title)
             return ss.add_worksheet(title=title,rows=600,cols=cols)
-
     def open_all(self):
         ss=self._client.open_by_key(SPREADSHEET_ID)
-        return (
-            self._get_or_create(ss,SHEET_VOLUME,  cols=15),
-            self._get_or_create(ss,SHEET_TURNOVER,cols=15),
-            self._get_or_create(ss,SHEET_FUTURES, cols=55),
-            self._get_or_create(ss,SHEET_OPTIONS, cols=60),
-        )
+        return (self._get_or_create(ss,SHEET_VOLUME,  cols=15),
+                self._get_or_create(ss,SHEET_TURNOVER,cols=15),
+                self._get_or_create(ss,SHEET_FUTURES, cols=55),
+                self._get_or_create(ss,SHEET_OPTIONS, cols=60))
 
-    def write_vol_turnover(self, ws_vol, ws_to, data_vol, data_to, fetched_date):
-        """
-        Write Top 250 Volume and Top 250 Turnover sheets.
-        Fixes vs earlier version:
-          • Sheet is cleared before every write (no stale rows)
-          • Row 1 headers are written explicitly
-          • Status timestamp goes in D1 (same row as headers, not K2)
-          • All 3 data columns (Symbol, Volume/Turnover, CMP) are written
-        """
-        status = f"Data: {fetched_date}  |  Updated: {_ist_now()}"
+    def write_vol_turnover(self,ws_vol,ws_to,data_vol,data_to,fetched_date):
+        status=f"Data: {fetched_date}  |  Updated: {_ist_now()}"
+        vol_hdr=[["NSE Symbol","Trading Volume (Qty)","Close Price ₹",status]]
+        to_hdr =[["NSE Symbol","Turnover ₹","Close Price ₹",status]]
+        for ws,data,hdr in ((ws_vol,data_vol,vol_hdr),(ws_to,data_to,to_hdr)):
+            ws.clear(); time.sleep(0.5)
+            all_rows=hdr+data
+            ws.update(range_name=f"A1:D{len(all_rows)}",
+                      values=all_rows,value_input_option="USER_ENTERED")
+            log.info("'%s' → %d rows written",ws.title,len(data))
 
-        vol_headers  = [["NSE Symbol", "Trading Volume (Qty)", "Close Price ₹",
-                          status]]
-        to_headers   = [["NSE Symbol", "Turnover ₹",          "Close Price ₹",
-                          status]]
-
-        for ws, data, headers in (
-            (ws_vol, data_vol, vol_headers),
-            (ws_to,  data_to,  to_headers),
-        ):
-            ws.clear()
-            time.sleep(0.5)
-            n = len(data)
-            all_rows = headers + data          # row 1 = header, rows 2‥N+1 = data
-            # Write header + data in one batch (≤250 rows — well within limits)
-            ws.update(
-                range_name=f"A1:D{n + 1}",
-                values=all_rows,
-                value_input_option="USER_ENTERED",
-            )
-            log.info("'%s' → %d data rows written (+ 1 header)", ws.title, n)
-
-    def write_fo_sheet(self, ws, headers, rows, title):
-        all_data=[headers]+rows
-        n_cols=len(headers)
-        ws.clear()
-        time.sleep(1)
+    def write_fo_sheet(self,ws,headers,rows,title):
+        all_data=[headers]+rows; n_cols=len(headers)
+        ws.clear(); time.sleep(1)
         for start in range(0,len(all_data),WRITE_CHUNK):
             end=min(start+WRITE_CHUNK,len(all_data))
-            rng=f"A{start+1}:{_col_letter(n_cols)}{end}"
-            ws.update(range_name=rng,values=all_data[start:end],
-                      value_input_option="RAW")
+            ws.update(range_name=f"A{start+1}:{_col_letter(n_cols)}{end}",
+                      values=all_data[start:end],value_input_option="RAW")
             log.info("  '%s' rows %d–%d",title,start+1,end)
             if end<len(all_data): time.sleep(1.5)
         log.info("'%s' done — %d rows × %d cols",title,len(rows),n_cols)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — MAIN
+# SECTION 11 — MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     creds_json=os.environ.get("GCP_CREDENTIALS")
-    if not creds_json:
-        raise EnvironmentError("GCP_CREDENTIALS not set.")
+    if not creds_json: raise EnvironmentError("GCP_CREDENTIALS not set.")
+    ist_today=_ist_today()
+    log.info("═"*60)
+    log.info("NSE Auto-Sheet v7  —  %s",ist_today.strftime("%d-%b-%Y %H:%M IST"))
+    log.info("═"*60)
 
-    ist_today=datetime.utcnow()+timedelta(hours=5,minutes=30)
-    log.info("═"*60)
-    log.info("NSE Auto-Sheet v6  —  %s",ist_today.strftime("%d-%b-%Y %H:%M IST"))
-    log.info("═"*60)
+    # Warm up NSE session ONCE — all fetchers share it
+    _NSE.warm_up()
 
     writer=SheetsWriter(creds_json)
     ws_vol,ws_to,ws_fut,ws_opt=writer.open_all()
 
-    # ── Equity bhavcopy (today) ───────────────────────────────────────────────
+    # ── Equity bhavcopy ───────────────────────────────────────────────────────
     log.info("── Equity bhavcopy ──────────────────────────────────────")
-    eq_fetcher=BhavcopFetcher()
-    result,fetched_date=None,""
-    for days_back in range(LOOKBACK_DAYS+1):
-        cand=ist_today-timedelta(days=days_back)
-        if cand.weekday()>=5: continue
-        result=eq_fetcher.fetch(cand)
+    eq=BhavcopFetcher(); result=None; fetched_date=""
+    for cand in _trading_days_back(ist_today,LOOKBACK_DAYS):
+        result=eq.fetch(cand)
         if result: fetched_date=cand.strftime("%d-%b-%Y"); break
-    if not result:
-        raise RuntimeError("No equity bhavcopy found.")
-    data_vol,data_to,equity_cmp,delv_pct_map=result
+    if not result: raise RuntimeError("No equity bhavcopy found.")
+    data_vol,data_to,equity_cmp=result
     writer.write_vol_turnover(ws_vol,ws_to,data_vol,data_to,fetched_date)
 
-    # ── FO bhavcopy — today (OI) and yesterday (prev OI for OI change) ───────
-    log.info("── FO bhavcopy (OI) ─────────────────────────────────────")
-    fo_fetcher=FOBhavcopFetcher()
-    oi_map,oi_ce_map,oi_pe_map,oi_by_strike=fo_fetcher.fetch(
-        datetime.strptime(fetched_date,"%d-%b-%Y"))
+    # ── Delivery % (separate file) ────────────────────────────────────────────
+    log.info("── Delivery %% ───────────────────────────────────────────")
+    delv_map=DeliveryFetcher().fetch(ist_today)
 
-    # Previous day OI for OI-change column
-    prev_oi_map={}
-    for pb in range(1,5):
-        prev_cand=datetime.strptime(fetched_date,"%d-%b-%Y")-timedelta(days=pb)
-        if prev_cand.weekday()>=5: continue
-        pm,_,_,_=fo_fetcher.fetch(prev_cand)
-        if pm: prev_oi_map=pm; break
+    # ── FO bhavcopy (OI/PCR/Max Pain) ────────────────────────────────────────
+    log.info("── FO bhavcopy (OI) ─────────────────────────────────────")
+    fo=FOBhavcopFetcher()
+    bhavcopy_dt=datetime.strptime(fetched_date,"%d-%b-%Y")
+    oi_map,oi_ce,oi_pe,oi_by=fo.fetch(bhavcopy_dt)
+    # Previous day OI for OI-change
+    prev_oi={}
+    for cand in _trading_days_back(bhavcopy_dt,4):
+        pm,_,_,_=fo.fetch(cand)
+        if pm: prev_oi=pm; break
 
     # ── Index prices + VIX ───────────────────────────────────────────────────
     log.info("── Index prices + VIX ───────────────────────────────────")
-    idx_fetcher=IndexPriceFetcher()
-    index_cmp=idx_fetcher.fetch(ist_today)
-    india_vix=index_cmp.get("VIX")
-    log.info("  India VIX: %s",india_vix)
+    idx=IndexPriceFetcher()
+    index_cmp=idx.fetch(ist_today)
+    log.info("  India VIX: %s",index_cmp.get("VIX"))
 
     # ── Lot sizes ─────────────────────────────────────────────────────────────
     log.info("── Lot sizes ────────────────────────────────────────────")
     lot_sizes=LotSizeFetcher().fetch() or FALLBACK_LOTS
 
-    # ── 52-week High/Low ─────────────────────────────────────────────────────
-    log.info("── 52-week High/Low ─────────────────────────────────────")
+    # ── 52-Week High/Low ─────────────────────────────────────────────────────
+    log.info("── 52-Week High/Low ─────────────────────────────────────")
     wk52_hi,wk52_lo=Week52Fetcher().fetch()
 
-    # ── Price history (equity + index) for indicators ────────────────────────
-    log.info("── Price history (%d days) ──────────────────────────────",HISTORY_DAYS)
+    # ── Price history ────────────────────────────────────────────────────────
+    log.info("── Equity history (%d trading days) ─────────────────────",HISTORY_DAYS)
     equity_hist=EquityHistoryFetcher().fetch(ist_today,days=HISTORY_DAYS)
-    index_hist =idx_fetcher.fetch_history(ist_today,days=HISTORY_DAYS)
+    log.info("── Index history (%d trading days) ──────────────────────",HISTORY_DAYS)
+    index_hist =idx.fetch_history(ist_today,days=HISTORY_DAYS)
 
-    # ── Expiry dates ─────────────────────────────────────────────────────────
+    # ── Expiries ──────────────────────────────────────────────────────────────
     expiries=_expiry_dates()
-    log.info("── Expiries: %s | %s | %s ──────────────────────────────",*expiries)
+    log.info("── Expiries: %s | %s | %s",*expiries)
 
     # ── Build rows ────────────────────────────────────────────────────────────
     log.info("── Building F&O rows ────────────────────────────────────")
     fut_rows,opt_rows=build_all_rows(
-        lot_sizes,equity_cmp,index_cmp,
-        equity_hist,index_hist,
-        oi_map,oi_ce_map,oi_pe_map,oi_by_strike,
-        prev_oi_map,wk52_hi,wk52_lo,delv_pct_map,
-        expiries,
-    )
+        lot_sizes,equity_cmp,index_cmp,equity_hist,index_hist,
+        oi_map,oi_ce,oi_pe,oi_by,prev_oi,wk52_hi,wk52_lo,delv_map,expiries)
 
     # Sanity check
     if fut_rows and len(fut_rows[0])!=len(FUT_HEADERS):
@@ -1244,7 +1024,6 @@ def main():
     # ── Write sheets ──────────────────────────────────────────────────────────
     log.info("── Writing Futures F&O ──────────────────────────────────")
     writer.write_fo_sheet(ws_fut,FUT_HEADERS,fut_rows,SHEET_FUTURES)
-
     log.info("── Writing Options F&O ──────────────────────────────────")
     writer.write_fo_sheet(ws_opt,OPT_HEADERS,opt_rows,SHEET_OPTIONS)
 
@@ -1252,6 +1031,5 @@ def main():
     log.info("✅  SUCCESS  |  Data: %s  |  %s",fetched_date,_ist_now())
     log.info("═"*60)
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
