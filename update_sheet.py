@@ -919,16 +919,73 @@ class SheetsWriter:
                 self._get_or_create(ss,SHEET_FUTURES, cols=55),
                 self._get_or_create(ss,SHEET_OPTIONS, cols=60))
 
-    def write_vol_turnover(self,ws_vol,ws_to,data_vol,data_to,fetched_date):
-        status=f"Data: {fetched_date}  |  Updated: {_ist_now()}"
-        vol_hdr=[["NSE Symbol","Trading Volume (Qty)","Close Price ₹",status]]
-        to_hdr =[["NSE Symbol","Turnover ₹","Close Price ₹",status]]
-        for ws,data,hdr in ((ws_vol,data_vol,vol_hdr),(ws_to,data_to,to_hdr)):
-            ws.clear(); time.sleep(0.5)
-            all_rows=hdr+data
-            ws.update(range_name=f"A1:D{len(all_rows)}",
-                      values=all_rows,value_input_option="USER_ENTERED")
-            log.info("'%s' → %d rows written",ws.title,len(data))
+    def write_vol_turnover(self, ws_vol, ws_to, data_vol, data_to, fetched_date):
+        """
+        Write ONLY columns A–C, rows 2 onwards.
+        ─────────────────────────────────────────────────────────────────────
+        DELIBERATELY does NOT call ws.clear() so that:
+          • Your Google formulas in columns D, E, F, … are preserved
+          • All cell formatting / conditional formatting stays intact
+          • Column widths, frozen rows, filters are untouched
+          • Row 1 headers you have manually set are never overwritten
+
+        Only the NSE data cells (A2:C251) are updated each run.
+        The status timestamp is written to A1 of each sheet so you
+        can see when data was last refreshed without touching headers.
+        ─────────────────────────────────────────────────────────────────────
+        """
+        status = f"Last updated: {fetched_date}  |  {_ist_now()}"
+
+        datasets = [
+            (ws_vol, data_vol, "Symbol", "Volume (Qty)", "Close ₹"),
+            (ws_to,  data_to,  "Symbol", "Turnover ₹",  "Close ₹"),
+        ]
+
+        for ws, data, col_a, col_b, col_c in datasets:
+            n = len(data)
+            if n == 0:
+                log.warning("'%s' — no data rows to write", ws.title)
+                continue
+
+            # ── Step 1: Write status timestamp to A1 only ──────────────
+            # Uses USER_ENTERED so the cell is treated as plain text.
+            # Does NOT touch B1, C1, D1 or any other header cell.
+            ws.update(
+                range_name="A1",
+                values=[[status]],
+                value_input_option="USER_ENTERED",
+            )
+
+            # ── Step 2: Overwrite ONLY A2:C(n+1) with fresh NSE data ───
+            # RAW mode: prevents Sheets from misinterpreting symbols
+            # (e.g. "M&M" or numbers) as formulas or dates.
+            # Columns D onwards — where your formulas live — are NEVER touched.
+            ws.update(
+                range_name=f"A2:C{n + 1}",
+                values=data,
+                value_input_option="RAW",
+            )
+
+            # ── Step 3: Clear stale rows below the new data ─────────────
+            # If a previous run had more rows, blank them out so old
+            # symbols don't linger. Clears A:C only — formulas in D+ safe.
+            # TOP_N is always 250 so max rows = 251 (header + 250 data).
+            # We clear up to row 260 as a safe buffer.
+            clear_from = n + 2          # first row after new data
+            clear_to   = TOP_N + 10    # safe upper bound
+            if clear_from <= clear_to:
+                blank_rows = [["", "", ""] for _ in range(clear_to - clear_from + 1)]
+                ws.update(
+                    range_name=f"A{clear_from}:C{clear_to}",
+                    values=blank_rows,
+                    value_input_option="RAW",
+                )
+
+            log.info(
+                "'%s' → %d data rows written to A2:C%d  "
+                "(formulas in D+ preserved, formatting intact)",
+                ws.title, n, n + 1,
+            )
 
     def write_fo_sheet(self,ws,headers,rows,title):
         all_data=[headers]+rows; n_cols=len(headers)
