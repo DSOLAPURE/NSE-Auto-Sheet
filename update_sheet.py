@@ -774,6 +774,18 @@ class HistoryFetcher:
         log.info("  52-wk H/L: %d symbols", len(hi_map))
         return hi_map, lo_map
 
+    @staticmethod
+    def compute_52wk_from_history(combined_history: dict):
+        """
+        Compute 52-wk High/Low from ALREADY FETCHED history dict.
+        Called in main() using the combined equity + index history,
+        so zero additional HTTP requests are needed.
+        Returns ({sym: high}, {sym: low})
+        """
+        hi_map = {s: round(max(v), 2) for s, v in combined_history.items() if v}
+        lo_map = {s: round(min(v), 2) for s, v in combined_history.items() if v}
+        return hi_map, lo_map
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 7 — SHEET HEADERS
@@ -856,6 +868,8 @@ def _analytics_block(sym, ltp, lot,
     atm_p = _atm_premium(ltp)
     iv_s  = _calc_iv(ltp, atm_p) if ltp > 0 else "—"
     mp    = _calc_max_pain(oi_by.get(sym, {}))
+    # equity_hist here is actually the caller-supplied history dict
+    # (either global equity_hist for stocks, or local index history for indices)
     hist  = equity_hist.get(sym, [])
     sup, res = _calc_support_resistance(hist)
     beta  = _calc_beta(hist, nifty_hist) if (hist and nifty_hist) else None
@@ -937,10 +951,13 @@ def build_all_rows(lot_sizes, equity_cmp, index_cmp, equity_hist, index_hist,
     nifty_hist = index_hist.get("NIFTY") or equity_hist.get("NIFTY", [])
     india_vix  = index_cmp.get("VIX")
 
-    def _ana(sym, ltp, lot):
+    def _ana(sym, ltp, lot, local_hist=None):
+        # For indices, pass their own history dict so RSI/MACD/Beta/Support
+        # use the correct index price series instead of an empty equity lookup.
+        h = local_hist if local_hist is not None else equity_hist
         return _analytics_block(
             sym, ltp, lot, oi_map, oi_ce, oi_pe, oi_by, prev_oi,
-            wk52_hi, wk52_lo, delv_map, india_vix, equity_hist, nifty_hist)
+            wk52_hi, wk52_lo, delv_map, india_vix, h, nifty_hist)
 
     # ── Indices (top 5 rows) ──────────────────────────────────────────────────
     log.info("Building index rows…")
@@ -953,12 +970,18 @@ def build_all_rows(lot_sizes, equity_cmp, index_cmp, equity_hist, index_hist,
             ltp = INDEX_FALLBACK_CMP.get(sym, 0)
         if ltp == 0:
             continue
-        hist = index_hist.get(sym) or equity_hist.get(sym, [])
-        h    = {sym: hist}
-        ana  = _ana(sym, ltp, lot)
+        # Use index history (from ind_close_all CSV) for MACD/RSI/Beta.
+        # Fallback to equity_hist if index_hist is empty for this symbol.
+        # This ensures BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50 all get
+        # their own price history rather than an empty list.
+        idx_close_hist = index_hist.get(sym) or equity_hist.get(sym, [])
+        # Build a local history dict with THIS index's closes
+        h = {sym: idx_close_hist}
+        ana = _ana(sym, ltp, lot, h)
         fut_rows.append(_build_fut_row(sr, name, sym, sector, lot, ltp, margin_pct, expiries, h, ana, "Index Future"))
         opt_rows.append(_build_opt_row(sr, name, sym, sector, lot, ltp, expiries, h, ana, "Index Option"))
-        log.info("  %-12s  CMP=₹%-8s  Lot=%d", sym, f"{ltp:,.0f}", lot)
+        log.info("  %-12s  CMP=₹%-8s  Lot=%-4d  History=%d days",
+                 sym, f"{ltp:,.0f}", lot, len(idx_close_hist))
         sr += 1
 
     # ── Stocks (alphabetical) ─────────────────────────────────────────────────
@@ -1119,13 +1142,23 @@ def main():
     hist_fetcher = HistoryFetcher()
     equity_hist  = hist_fetcher.fetch(ist_today, days=HISTORY_DAYS)
 
-    # ── 7. 52-Week High/Low (computed from history — no separate file) ────────
-    log.info("── 52-Week High/Low (from %d trading days history) ──────", WEEK52_DAYS)
-    wk52_hi, wk52_lo = hist_fetcher.fetch_52wk(ist_today)
-
-    # ── 8. Index history for trend / Beta ────────────────────────────────────
+    # ── 7. Index history for trend / Beta / MACD ────────────────────────────
     log.info("── Index history (%d trading days) ──────────────────────", HISTORY_DAYS)
     index_hist = idx_fetcher.fetch_history(ist_today, days=HISTORY_DAYS)
+
+    # ── 8. 52-Week High/Low — computed from ALREADY FETCHED history ──────────
+    # Merges equity_hist + index_hist so indices also get 52wk values.
+    # Zero additional HTTP calls — reuses data already downloaded in steps 6 & 7.
+    log.info("── 52-Week High/Low (from combined history — 0 extra HTTP calls)")
+    combined_hist = {**equity_hist}
+    for sym, closes in index_hist.items():
+        if sym not in combined_hist:
+            combined_hist[sym] = closes
+        else:
+            # Merge: take union, sort by most data
+            combined_hist[sym] = closes if len(closes) > len(combined_hist[sym]) else combined_hist[sym]
+    wk52_hi, wk52_lo = HistoryFetcher.compute_52wk_from_history(combined_hist)
+    log.info("  52-wk H/L computed: %d symbols (incl. indices)", len(wk52_hi))
 
     # ── 9. Expiry dates ───────────────────────────────────────────────────────
     expiries = _expiry_dates()
@@ -1158,8 +1191,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PYEOF
-echo "Lines: $(wc -l < /home/claude/update_sheet_v8.py)"
-Output
-
-Lines: 1160
