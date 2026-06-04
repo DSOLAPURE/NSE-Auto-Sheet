@@ -57,6 +57,7 @@ SHEET_VOLUME     = "Top 250 Stocks"
 SHEET_TURNOVER   = "Top 250 Turnover"
 SHEET_FUTURES    = "Futures F&O"
 SHEET_OPTIONS    = "Options F&O"
+SHEET_CHAIN      = "Index Option Chain"  # new option chain sheet
 TOP_N            = 250
 LOOKBACK_DAYS    = 7
 REQUEST_TIMEOUT  = 30
@@ -1026,6 +1027,7 @@ class SheetsWriter:
             self._get_or_create(ss, SHEET_TURNOVER, cols=15),
             self._get_or_create(ss, SHEET_FUTURES,  cols=55),
             self._get_or_create(ss, SHEET_OPTIONS,  cols=60),
+            self._get_or_create(ss, SHEET_CHAIN,    cols=60),
         )
 
     def write_vol_turnover(self, ws_vol, ws_to, data_vol, data_to, fetched_date):
@@ -1055,6 +1057,98 @@ class SheetsWriter:
                           value_input_option="RAW")
             log.info("'%s' → %d rows in A2:C%d  (D+ formulas & formatting intact)",
                      ws.title, n, n + 1)
+
+    def add_chain_dropdowns(self, ws, chain_rows):
+        """
+        Add Google Sheets data validation dropdowns so users can filter
+        by Index (col A), Expiry Type (col B), or Expiry Date (col C).
+
+        Since the Google Sheets API does not natively support multi-column
+        dropdown slicers, we implement this by:
+          1. Adding data validation to col A (Index) to restrict to valid index names
+          2. Adding data validation to col B (Expiry Type) for Weekly/Monthly values
+          3. Adding data validation to col C (Expiry Date) for valid expiry dates
+          4. Adding a helper filter guide in a note at the top
+
+        Users can then use Data → Create a filter (or Ctrl+Shift+L) to get
+        full dropdown filtering across all columns.
+        """
+        if not chain_rows:
+            return
+
+        n_rows = len(chain_rows) + 1   # +1 for header
+
+        # Collect unique values for validation lists
+        indices      = sorted(set(r[0] for r in chain_rows))
+        expiry_types = sorted(set(r[1] for r in chain_rows))
+        expiry_dates = sorted(set(r[2] for r in chain_rows))
+
+        idx_list  = ",".join(indices)
+        ety_list  = ",".join(expiry_types)
+        exp_list  = ",".join(expiry_dates)
+
+        # Build batch data validation requests via the Sheets API
+        ws_id  = ws._properties["sheetId"]
+
+        def _dv_rule(col_idx, values_str):
+            """Build a setDataValidation request for a column."""
+            return {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "startRowIndex": 1,       # skip header row
+                        "endRowIndex":   n_rows,
+                        "startColumnIndex": col_idx,
+                        "endColumnIndex":   col_idx + 1,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [{"userEnteredValue": v}
+                                       for v in values_str.split(",")],
+                        },
+                        "showCustomUi":  True,
+                        "strict":        False,   # allow typed values too
+                    },
+                }
+            }
+
+        requests_body = [
+            _dv_rule(0, idx_list),     # col A — Index
+            _dv_rule(1, ety_list),     # col B — Expiry Type
+            _dv_rule(2, exp_list),     # col C — Expiry Date
+        ]
+
+        # Apply freeze + auto-filter on first row
+        requests_body += [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": ws_id,
+                        "gridProperties": {"frozenRowCount": 1},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            },
+            {
+                "setBasicFilter": {
+                    "filter": {
+                        "range": {
+                            "sheetId":          ws_id,
+                            "startRowIndex":    0,
+                            "endRowIndex":      n_rows,
+                            "startColumnIndex": 0,
+                            "endColumnIndex":   len(OC_HEADERS),
+                        }
+                    }
+                }
+            },
+        ]
+
+        # Execute via batchUpdate
+        ss_obj = self._client.open_by_key(SPREADSHEET_ID)
+        ss_obj.batch_update({"requests": requests_body})
+        log.info("  Dropdowns + auto-filter applied to '%s'", ws.title)
 
     def write_fo_sheet(self, ws, headers, rows, title):
         """
@@ -1093,7 +1187,7 @@ def main():
     log.info("═" * 60)
 
     writer = SheetsWriter(creds_json)
-    ws_vol, ws_to, ws_fut, ws_opt = writer.open_all()
+    ws_vol, ws_to, ws_fut, ws_opt, ws_chain = writer.open_all()
 
     # ── 1. CM Equity bhavcopy ────────────────────────────────────────────────
     log.info("── CM Equity bhavcopy ───────────────────────────────────")
@@ -1184,9 +1278,313 @@ def main():
     log.info("── Writing Options F&O ──────────────────────────────────")
     writer.write_fo_sheet(ws_opt, OPT_HEADERS, opt_rows, SHEET_OPTIONS)
 
+    # ── 12. Build and write Option Chain sheet ────────────────────────────────
+    log.info("── Building Option Chain ─────────────────────────────────")
+    chain_rows = build_option_chain_rows(
+        index_cmp, index_hist, lot_sizes,
+        oi_map, oi_ce, oi_pe, oi_by, prev_oi,
+        wk52_hi, wk52_lo, delv_map, expiries,
+    )
+    if chain_rows and len(chain_rows[0]) != len(OC_HEADERS):
+        raise ValueError(f"Chain row={len(chain_rows[0])} vs OC_HEADERS={len(OC_HEADERS)}")
+
+    log.info("── Writing Index Option Chain ────────────────────────────")
+    writer.write_fo_sheet(ws_chain, OC_HEADERS, chain_rows, SHEET_CHAIN)
+
+    # ── 13. Add dropdown filters via data validation ──────────────────────────
+    # Col B = Expiry Type  (Weekly / Monthly-Near / Monthly-Mid)
+    # Col C = Expiry Date  (actual date strings)
+    # Col A = Index name   (5 index names)
+    log.info("── Setting up dropdown filters ───────────────────────────")
+    try:
+        writer.add_chain_dropdowns(ws_chain, chain_rows)
+    except Exception as e:
+        log.warning("  Dropdown setup failed (non-fatal): %s", e)
+
     log.info("═" * 60)
     log.info("✅  SUCCESS  |  Data: %s  |  %s", fetched_date, _ist_now())
     log.info("═" * 60)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADDITION TO update_sheet.py  —  Option Chain Sheet
+# ══════════════════════════════════════════════════════════════════════════════
+# Paste this BEFORE the main() function and wire it in as shown at the bottom.
+# ══════════════════════════════════════════════════════════════════════════════
+
+SHEET_CHAIN      = "Index Option Chain"
+
+# How many OTM strikes to show each side of ATM
+CHAIN_OTM_DEPTH  = 15   # 15 strikes above ATM + 15 below = 31 rows per index/expiry
+
+# Option chain sheet header — strike-level detail
+OC_HEADERS = [
+    # Strike metadata
+    "Index",                            # 1
+    "Expiry Type",                      # 2  Weekly / Monthly
+    "Expiry Date",                      # 3
+    "Strike ₹",                         # 4
+    "Strike Type",                      # 5  ITM-CE / ATM / ITM-PE
+    "CMP ₹",                            # 6
+    "Lot Size",                         # 7
+    # CE columns
+    "CE OI\n(Lots)",                    # 8
+    "CE OI\nChange",                    # 9
+    "CE LTP ₹\n(Approx.)",             # 10
+    "CE Premium\n1 Lot ₹",             # 11
+    "CE IV %",                          # 12
+    # PE columns
+    "PE OI\n(Lots)",                    # 13
+    "PE OI\nChange",                    # 14
+    "PE LTP ₹\n(Approx.)",             # 15
+    "PE Premium\n1 Lot ₹",             # 16
+    "PE IV %",                          # 17
+    # Index-level analytics (same for all rows of same index/expiry)
+    "Intraday\nTrend",                  # 18
+    "Swing\nTrend",                     # 19
+    "Options Strategy\n(Intraday)",     # 20
+    "Options Strategy\n(Swing)",        # 21
+    "Intraday Signal:\nBest Strategy",  # 22
+    "Intraday:\nCE Entry",              # 23
+    "Intraday:\nPE Entry",              # 24
+    "Intraday:\nCE Target",             # 25
+    "Intraday:\nPE Target",             # 26
+    "Intraday:\nStop Loss",             # 27
+    "Intraday:\nMax Profit/Lot ₹",     # 28
+    "Intraday:\nMax Loss/Lot ₹",       # 29
+    "Intraday:\nRisk:Reward",           # 30
+    "Intraday:\nRationale",             # 31
+    "Swing Signal:\nBest Strategy",     # 32
+    "Swing:\nCE Entry",                 # 33
+    "Swing:\nPE Entry",                 # 34
+    "Swing:\nCE Target",                # 35
+    "Swing:\nPE Target",                # 36
+    "Swing:\nStop Loss",                # 37
+    "Swing:\nMax Profit/Lot ₹",        # 38
+    "Swing:\nMax Loss/Lot ₹",          # 39
+    "Swing:\nRisk:Reward",              # 40
+    "Swing:\nRationale",                # 41
+    "Open Interest\n(OI — Lots)",       # 42  index total OI
+    "OI Change\n(vs Prev Day)",         # 43
+    "PCR\n(Put-Call Ratio)",            # 44
+    "52-Week\nHigh ₹",                 # 45
+    "52-Week\nLow ₹",                  # 46
+    "Delivery\n%",                      # 47
+    "India\nVIX",                       # 48
+    "IV %\n(Impl. Volatility)",         # 49
+    "Max Pain\nStrike ₹",              # 50
+    "Support\n₹",                       # 51
+    "Resistance\n₹",                    # 52
+    "Beta\nvs Nifty",                   # 53
+    "RSI\n(14-day)",                    # 54
+    "MACD Signal\n(12/26/9)",          # 55
+    "Notes",                            # 56
+]   # 56 columns
+
+
+def _strike_type(strike, atm, step):
+    """Label a strike as ITM-CE, ATM, or ITM-PE."""
+    if strike == atm:
+        return "🎯 ATM"
+    if strike < atm:
+        return f"ITM-PE  ({int((atm-strike)/step)} step)"
+    return f"ITM-CE  ({int((strike-atm)/step)} step)"
+
+
+def _ce_premium_for_strike(ltp, strike, days=25, iv=0.28):
+    """Approx Black-Scholes call premium for a given strike."""
+    S = ltp; K = strike
+    T = max(days, 1) / 252
+    intrinsic = max(S - K, 0)
+    time_val  = 0.4 * iv * math.sqrt(T) * S * math.exp(-0.5 * ((S-K)/(iv*S*math.sqrt(T)+1))**2)
+    return max(1, int(round((intrinsic + time_val) / 5) * 5))
+
+
+def _pe_premium_for_strike(ltp, strike, days=25, iv=0.28):
+    """Approx Black-Scholes put premium for a given strike."""
+    S = ltp; K = strike
+    T = max(days, 1) / 252
+    intrinsic = max(K - S, 0)
+    time_val  = 0.4 * iv * math.sqrt(T) * S * math.exp(-0.5 * ((K-S)/(iv*S*math.sqrt(T)+1))**2)
+    return max(1, int(round((intrinsic + time_val) / 5) * 5))
+
+
+def _iv_for_strike(prem, ltp, strike, days=25):
+    """Back-solve IV for a given option premium and strike."""
+    S = ltp; K = strike; T = max(days, 1) / 252
+    denom = 0.4 * S * math.sqrt(T) * math.exp(-0.5 * ((S-K)/(0.3*S*math.sqrt(T)+1))**2)
+    if denom == 0:
+        return "—"
+    iv = prem / denom * 100
+    return f"{min(iv, 999):.1f}%"
+
+
+def _expiry_days_remaining(expiry_str):
+    """Days from today to expiry date string '%d-%b-%Y'."""
+    try:
+        exp = datetime.strptime(expiry_str, "%d-%b-%Y").date()
+        today = _ist_today().date()
+        return max((exp - today).days, 1)
+    except Exception:
+        return 25
+
+
+def _weekly_expiry():
+    """
+    Next weekly expiry for Bank Nifty (Thursday) and Nifty/FinNifty (Thursday).
+    Returns date string.
+    """
+    today = _ist_today().date()
+    # Find next Thursday
+    days_ahead = (3 - today.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return (today + timedelta(days=days_ahead)).strftime("%d-%b-%Y")
+
+
+def build_option_chain_rows(
+    index_cmp, index_hist, lot_sizes,
+    oi_map, oi_ce, oi_pe, oi_by, prev_oi,
+    wk52_hi, wk52_lo, delv_map,
+    expiries,        # (near, mid, far) monthly expiries
+):
+    """
+    Build all rows for the Option Chain sheet.
+    One block per (index × expiry_type).
+    Indices: NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50
+    Expiry types: Weekly (near-Thursday), Monthly-Near, Monthly-Mid
+    """
+    rows = []
+    nifty_hist = index_hist.get("NIFTY", [])
+    india_vix  = index_cmp.get("VIX")
+
+    # Weekly expiry (next Thursday)
+    weekly_exp = _weekly_expiry()
+
+    # Build expiry schedule per index
+    # Nifty, BankNifty, FinNifty have weekly expiries
+    # MidcapSelect, NiftyNext50 are monthly only
+    index_expiry_schedule = {
+        "NIFTY":      [("Weekly", weekly_exp), ("Monthly-Near", expiries[0]), ("Monthly-Mid", expiries[1])],
+        "BANKNIFTY":  [("Weekly", weekly_exp), ("Monthly-Near", expiries[0]), ("Monthly-Mid", expiries[1])],
+        "FINNIFTY":   [("Weekly", weekly_exp), ("Monthly-Near", expiries[0]), ("Monthly-Mid", expiries[1])],
+        "MIDCPNIFTY": [                        ("Monthly-Near", expiries[0]), ("Monthly-Mid", expiries[1])],
+        "NIFTYNXT50": [                        ("Monthly-Near", expiries[0]), ("Monthly-Mid", expiries[1])],
+    }
+
+    for sym, name, sector, margin_pct in INDEX_META:
+        ltp  = index_cmp.get(sym, INDEX_FALLBACK_CMP.get(sym, 0))
+        lot  = lot_sizes.get(sym, FALLBACK_LOTS.get(sym, 0))
+        hist = index_hist.get(sym, [])
+        if ltp == 0 or lot == 0:
+            continue
+
+        # ── Index-level analytics (same for all strike rows) ────────────────
+        atm_p   = _atm_premium(ltp)
+        intra_t = _trend(hist[-5:] if len(hist) >= 5 else hist)
+        swing_t = _trend(hist)
+        si = _strategy_engine(ltp, atm_p, intra_t, swing_t, lot, "intraday")
+        ss = _strategy_engine(ltp, atm_p, intra_t, swing_t, lot, "swing")
+
+        oi_total  = oi_map.get(sym, 0)
+        oi_ce_tot = oi_ce.get(sym, 0)
+        oi_pe_tot = oi_pe.get(sym, 0)
+        prev      = prev_oi.get(sym, 0)
+        oi_chg    = (oi_total - prev) if (oi_total > 0 and prev > 0) else None
+        pcr       = round(oi_pe_tot / oi_ce_tot, 2) if oi_ce_tot > 0 else None
+        pcr_s     = (f"{pcr} 🟢 Bullish" if pcr and pcr > 1.2
+                     else f"{pcr} 🔴 Bearish" if pcr and pcr < 0.8
+                     else f"{pcr} 🟡 Neutral" if pcr else "—")
+        mp        = _calc_max_pain(oi_by.get(sym, {}))
+        hi52      = wk52_hi.get(sym) or "—"
+        lo52      = wk52_lo.get(sym) or "—"
+        vix_s     = f"{india_vix:.2f}" if india_vix else "—"
+        iv_s      = _calc_iv(ltp, atm_p)
+        sup, res  = _calc_support_resistance(hist)
+        beta      = _calc_beta(hist, nifty_hist) if (hist and nifty_hist) else None
+        rsi       = _calc_rsi(hist)
+        _, _, _, macd_lbl = _calc_macd(hist)
+
+        # Shared analytics tail — appended to every strike row for this index
+        analytics_tail = [
+            int(oi_total)  if oi_total  else "—",
+            int(oi_chg)    if oi_chg is not None else "—",
+            pcr_s,
+            hi52, lo52,
+            "—",           # Delivery — not applicable for indices
+            vix_s, iv_s,
+            f"₹{mp:,}" if mp else "—",
+            f"₹{sup:,.2f}" if sup else "—",
+            f"₹{res:,.2f}" if res else "—",
+            str(beta) if beta is not None else "—",
+            _rsi_label(rsi),
+            macd_lbl,
+            "",            # Notes
+        ]   # 15 items → cols 42–56
+
+        # Strategy tail
+        strat_tail = [
+            _trend_label(intra_t), _trend_label(swing_t),
+            si["Strategy"], ss["Strategy"],
+            si["Strategy"],       _sv(si, "CE Entry"),  _sv(si, "PE Entry"),
+            _sv(si, "CE Target"), _sv(si, "PE Target"), _sv(si, "Stop Loss"),
+            _sv(si, "Max Profit/Lot"), _sv(si, "Max Loss/Lot"), _sv(si, "Risk:Reward"),
+            _sv(si, "Rationale"),
+            ss["Strategy"],       _sv(ss, "CE Entry"),  _sv(ss, "PE Entry"),
+            _sv(ss, "CE Target"), _sv(ss, "PE Target"), _sv(ss, "Stop Loss"),
+            _sv(ss, "Max Profit/Lot"), _sv(ss, "Max Loss/Lot"), _sv(ss, "Risk:Reward"),
+            _sv(ss, "Rationale"),
+        ]   # 24 items → cols 18–41
+
+        # ── Strike schedule ─────────────────────────────────────────────────
+        step = (100 if ltp > 20000 else 50 if ltp > 5000 else
+                20  if ltp > 1000  else 10  if ltp > 200  else 5)
+        atm  = _round_strike(ltp)
+
+        strikes = [atm + i * step
+                   for i in range(-CHAIN_OTM_DEPTH, CHAIN_OTM_DEPTH + 1)]
+
+        for exp_type, exp_date in index_expiry_schedule.get(sym, []):
+            days_left = _expiry_days_remaining(exp_date)
+
+            for strike in strikes:
+                s_type   = _strike_type(strike, atm, step)
+                ce_prem  = _ce_premium_for_strike(ltp, strike, days_left)
+                pe_prem  = _pe_premium_for_strike(ltp, strike, days_left)
+                ce_iv    = _iv_for_strike(ce_prem, ltp, strike, days_left)
+                pe_iv    = _iv_for_strike(pe_prem, ltp, strike, days_left)
+
+                # Strike-level OI from oi_by dict
+                strike_oi = oi_by.get(sym, {}).get(strike, {})
+                ce_oi_s   = int(strike_oi.get("CE", 0)) if strike_oi.get("CE") else "—"
+                pe_oi_s   = int(strike_oi.get("PE", 0)) if strike_oi.get("PE") else "—"
+
+                row = [
+                    name,                        # 1  Index
+                    exp_type,                    # 2  Expiry Type
+                    exp_date,                    # 3  Expiry Date
+                    strike,                      # 4  Strike ₹
+                    s_type,                      # 5  Strike Type
+                    round(ltp, 2),               # 6  CMP ₹
+                    lot,                         # 7  Lot Size
+                    ce_oi_s,                     # 8  CE OI
+                    "—",                         # 9  CE OI Change (strike-level not in bhavcopy)
+                    ce_prem,                     # 10 CE LTP
+                    ce_prem * lot,               # 11 CE 1-lot cost
+                    ce_iv,                       # 12 CE IV
+                    pe_oi_s,                     # 13 PE OI
+                    "—",                         # 14 PE OI Change
+                    pe_prem,                     # 15 PE LTP
+                    pe_prem * lot,               # 16 PE 1-lot cost
+                    pe_iv,                       # 17 PE IV
+                ] + strat_tail + analytics_tail
+
+                rows.append(row)
+
+    log.info("Option Chain: %d rows built", len(rows))
+    return rows
+
+
 
 
 if __name__ == "__main__":
