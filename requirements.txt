@@ -1,0 +1,5 @@
+Plaintext
+gspread
+oauth2client
+pandas
+requests
