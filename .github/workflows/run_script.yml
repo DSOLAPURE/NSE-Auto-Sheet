@@ -1,0 +1,32 @@
+name: Automate NSE Auto-Sheet
+
+on:
+  schedule:
+    # Runs every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Allows you to manually click "Run" from GitHub UI
+
+jobs:
+  update-sheets:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip' # Speeds up subsequent runs
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install gspread oauth2client pandas requests
+
+      - name: Run Auto-Sheet Script
+        env:
+          # Seamlessly passes your Google credentials to the script safely
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: python update_sheet.py
